@@ -59,6 +59,14 @@ const (
 	defaultMaxConcurrentStreams = 1000
 )
 
+// custom http2 settings
+type HTTP2Settings struct {
+	Settings       []Setting
+	ConnectionFlow int
+	HeaderPriority *PriorityParam
+	PriorityFrames []PriorityFrame
+}
+
 // Transport is an HTTP/2 Transport.
 //
 // A Transport internally caches connections to servers. It is safe
@@ -177,6 +185,9 @@ type Transport struct {
 
 	connPoolOnce  sync.Once
 	connPoolOrDef ClientConnPool // non-nil version of ConnPool
+
+	// custom http2 settings
+	HTTP2Settings *HTTP2Settings
 }
 
 func (t *Transport) maxHeaderListSize() uint32 {
@@ -599,9 +610,10 @@ func (t *Transport) CloseIdleConnections() {
 }
 
 var (
-	errClientConnClosed    = errors.New("http2: client conn is closed")
-	errClientConnUnusable  = errors.New("http2: client conn not usable")
-	errClientConnGotGoAway = errors.New("http2: Transport received Server's graceful shutdown GOAWAY")
+	errClientConnClosed               = errors.New("http2: client conn is closed")
+	errClientConnUnusable             = errors.New("http2: client conn not usable")
+	errClientConnGotGoAway            = errors.New("http2: Transport received Server's graceful shutdown GOAWAY")
+	errSettingsIncludeIllegalSettings = errors.New("http2: Settings contains either SettingInitialWindowSize or SettingHeaderTableSize, which should be specified in transport instead")
 )
 
 // shouldRetryRequest is called by RoundTrip when a request fails to get
@@ -806,9 +818,42 @@ func (t *Transport) newClientConn(c net.Conn, singleUse bool) (*ClientConn, erro
 	}
 
 	cc.bw.Write(clientPreface)
-	cc.fr.WriteSettings(initialSettings...)
-	cc.fr.WriteWindowUpdate(0, transportDefaultConnFlow)
-	cc.inflow.init(transportDefaultConnFlow + initialWindowSize)
+	//cc.fr.WriteSettings(initialSettings...)
+	//cc.fr.WriteWindowUpdate(0, transportDefaultConnFlow)
+	//cc.inflow.init(transportDefaultConnFlow + initialWindowSize)
+
+	if t.HTTP2Settings != nil {
+		inflowValue := transportDefaultStreamFlow
+		if t.HTTP2Settings.Settings != nil {
+			for _, setting := range t.HTTP2Settings.Settings {
+				if setting.ID == SettingInitialWindowSize {
+					inflowValue = int(setting.Val)
+				}
+			}
+		}
+		if len(t.HTTP2Settings.Settings) != 0 {
+			cc.fr.WriteSettings(t.HTTP2Settings.Settings...)
+		} else {
+			cc.fr.WriteSettings(initialSettings...)
+		}
+		var connectionFlow = transportDefaultConnFlow
+		if t.HTTP2Settings.ConnectionFlow != 0 {
+			connectionFlow = t.HTTP2Settings.ConnectionFlow
+		}
+		cc.fr.WriteWindowUpdate(0, uint32(connectionFlow))
+		if t.HTTP2Settings.PriorityFrames != nil {
+			for _, frame := range t.HTTP2Settings.PriorityFrames {
+				cc.fr.WritePriority(frame.StreamID, frame.PriorityParam)
+				cc.nextStreamID = frame.StreamID + uint32(2)
+			}
+		}
+		cc.inflow.add(inflowValue + connectionFlow)
+	} else {
+		cc.fr.WriteSettings(initialSettings...)
+		cc.fr.WriteWindowUpdate(0, transportDefaultConnFlow)
+		cc.inflow.init(transportDefaultConnFlow + initialWindowSize)
+	}
+
 	cc.bw.Flush()
 	if cc.werr != nil {
 		cc.Close()
@@ -1622,11 +1667,16 @@ func (cc *ClientConn) writeHeaders(streamID uint32, endStream bool, maxFrameSize
 		hdrs = hdrs[len(chunk):]
 		endHeaders := len(hdrs) == 0
 		if first {
+			headersPriorityParam := PriorityParam{}
+			if cc.t.HTTP2Settings.HeaderPriority != nil {
+				headersPriorityParam = *cc.t.HTTP2Settings.HeaderPriority
+			}
 			cc.fr.WriteHeaders(HeadersFrameParam{
 				StreamID:      streamID,
 				BlockFragment: chunk,
 				EndStream:     endStream,
 				EndHeaders:    endHeaders,
+				Priority:      headersPriorityParam,
 			})
 			first = false
 		} else {
@@ -1885,6 +1935,12 @@ func (cc *ClientConn) encodeHeaders(req *http.Request, addGzipHeader bool, trail
 	// continue to reuse the hpack encoder for future requests)
 	for k, vv := range req.Header {
 		if !httpguts.ValidHeaderFieldName(k) {
+			// If the header is magic key, the headers would have been ordered
+			// by this step. It is ok to delete and not raise an error
+			if k == http.HeaderOrderKey || k == http.PHeaderOrderKey {
+				continue
+			}
+
 			return nil, fmt.Errorf("invalid HTTP header name %q", k)
 		}
 		for _, v := range vv {
@@ -1901,54 +1957,84 @@ func (cc *ClientConn) encodeHeaders(req *http.Request, addGzipHeader bool, trail
 		// target URI (the path-absolute production and optionally a '?' character
 		// followed by the query production (see Sections 3.3 and 3.4 of
 		// [RFC3986]).
-		f(":authority", host)
+		pHeaderOrder, ok := req.Header[http.PHeaderOrderKey]
 		m := req.Method
 		if m == "" {
 			m = http.MethodGet
 		}
-		f(":method", m)
-		if req.Method != "CONNECT" {
-			f(":path", path)
-			f(":scheme", req.URL.Scheme)
+		if ok {
+			// follow based on pseudo header order
+			for _, p := range pHeaderOrder {
+				switch p {
+				case ":authority":
+					f(":authority", host)
+				case ":method":
+					f(":method", req.Method)
+				case ":path":
+					if req.Method != "CONNECT" {
+						f(":path", path)
+					}
+				case ":scheme":
+					if req.Method != "CONNECT" {
+						f(":scheme", req.URL.Scheme)
+					}
+
+				// (zMrKrabz): Currently skips over unrecognized pheader fields,
+				// should throw error or something but works for now.
+				default:
+					continue
+				}
+			}
+		} else {
+			f(":authority", host)
+			f(":method", m)
+			if req.Method != "CONNECT" {
+				f(":path", path)
+				f(":scheme", req.URL.Scheme)
+			}
 		}
 		if trailers != "" {
 			f("trailer", trailers)
 		}
 
+		// Should clone, because this function is called twice; to read and to write.
+		// If headers are added to the req, then headers would be added twice.
+		hdrs := req.Header.Clone()
+		if _, ok := req.Header["content-length"]; !ok && shouldSendReqContentLength(req.Method, contentLength) {
+			hdrs["content-length"] = []string{strconv.FormatInt(contentLength, 10)}
+		}
+
+		// Formats and writes headers with f function
 		var didUA bool
-		for k, vv := range req.Header {
-			if asciiEqualFold(k, "host") || asciiEqualFold(k, "content-length") {
+		var kvs []http.HeaderKeyValues
+
+		if headerOrder, ok := hdrs[http.HeaderOrderKey]; ok {
+			order := make(map[string]int)
+			for i, v := range headerOrder {
+				order[v] = i
+			}
+			kvs, _ = hdrs.SortedKeyValuesBy(order, make(map[string]bool))
+		} else {
+			kvs, _ = hdrs.SortedKeyValues(make(map[string]bool))
+		}
+
+		for _, kv := range kvs {
+			if strings.EqualFold(kv.Key, "host") {
 				// Host is :authority, already sent.
-				// Content-Length is automatic, set below.
 				continue
-			} else if asciiEqualFold(k, "connection") ||
-				asciiEqualFold(k, "proxy-connection") ||
-				asciiEqualFold(k, "transfer-encoding") ||
-				asciiEqualFold(k, "upgrade") ||
-				asciiEqualFold(k, "keep-alive") {
+			} else if strings.EqualFold(kv.Key, "connection") || strings.EqualFold(kv.Key, "proxy-connection") ||
+				strings.EqualFold(kv.Key, "transfer-encoding") || strings.EqualFold(kv.Key, "upgrade") ||
+				strings.EqualFold(kv.Key, "keep-alive") {
 				// Per 8.1.2.2 Connection-Specific Header
 				// Fields, don't send connection-specific
 				// fields. We have already checked if any
 				// are error-worthy so just ignore the rest.
 				continue
-			} else if asciiEqualFold(k, "user-agent") {
-				// Match Go's http1 behavior: at most one
-				// User-Agent. If set to nil or empty string,
-				// then omit it. Otherwise if not mentioned,
-				// include the default (below).
-				didUA = true
-				if len(vv) < 1 {
-					continue
-				}
-				vv = vv[:1]
-				if vv[0] == "" {
-					continue
-				}
-			} else if asciiEqualFold(k, "cookie") {
+			} else if strings.EqualFold(kv.Key, "cookie") {
 				// Per 8.1.2.5 To allow for better compression efficiency, the
 				// Cookie header field MAY be split into separate header fields,
 				// each with one or more cookie-pairs.
-				for _, v := range vv {
+				for _, v := range kv.Values {
 					for {
 						p := strings.IndexByte(v, ';')
 						if p < 0 {
@@ -1967,17 +2053,24 @@ func (cc *ClientConn) encodeHeaders(req *http.Request, addGzipHeader bool, trail
 					}
 				}
 				continue
+			} else if strings.EqualFold(kv.Key, "user-agent") {
+				// Match Go's http1 behavior: at most one
+				// User-Agent. If set to nil or empty string,
+				// then omit it. Otherwise if not mentioned,
+				// include the default (below).
+				didUA = true
+				if len(kv.Values) > 1 {
+					kv.Values = kv.Values[:1]
+				}
+
+				if kv.Values[0] == "" {
+					continue
+				}
 			}
 
-			for _, v := range vv {
-				f(k, v)
+			for _, v := range kv.Values {
+				f(kv.Key, v)
 			}
-		}
-		if shouldSendReqContentLength(req.Method, contentLength) {
-			f("content-length", strconv.FormatInt(contentLength, 10))
-		}
-		if addGzipHeader {
-			f("accept-encoding", "gzip")
 		}
 		if !didUA {
 			f("user-agent", defaultUserAgent)
@@ -2003,6 +2096,10 @@ func (cc *ClientConn) encodeHeaders(req *http.Request, addGzipHeader bool, trail
 
 	// Header list size is ok. Write the headers.
 	enumerateHeaders(func(name, value string) {
+		// skips over writing magic key headers
+		if name == http.HeaderOrderKey || name == http.PHeaderOrderKey {
+			return
+		}
 		name, ascii := lowerHeader(name)
 		if !ascii {
 			// Skip writing invalid headers. Per RFC 7540, Section 8.1.2, header
