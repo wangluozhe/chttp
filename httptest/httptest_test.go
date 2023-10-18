@@ -5,7 +5,7 @@
 package httptest
 
 import (
-	"crypto/tls"
+	tls "github.com/refraction-networking/utls"
 	"io"
 	"net/http"
 	"net/url"

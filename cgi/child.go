@@ -9,9 +9,9 @@ package cgi
 
 import (
 	"bufio"
-	"crypto/tls"
 	"errors"
 	"fmt"
+	tls "github.com/refraction-networking/utls"
 	"github.com/wangluozhe/chttp"
 	"io"
 	"net"

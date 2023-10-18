@@ -6,8 +6,8 @@ package http_test
 
 import (
 	"fmt"
+	"github.com/wangluozhe/chttp"
 	"log"
-	"net/http"
 	"sync"
 )
 

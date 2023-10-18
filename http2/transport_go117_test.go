@@ -9,8 +9,8 @@ package http2
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
+	tls "github.com/refraction-networking/utls"
 	"github.com/wangluozhe/chttp"
 	"github.com/wangluozhe/chttp/httptest"
 

@@ -24,10 +24,10 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
+	tls "github.com/refraction-networking/utls"
 	"github.com/wangluozhe/chttp"
 	"io"
 	"log"

@@ -7,9 +7,9 @@ package http_test
 import (
 	"context"
 	"fmt"
+	"github.com/wangluozhe/chttp"
 	"io"
 	"log"
-	"net/http"
 	"os"
 	"os/signal"
 )

@@ -5,9 +5,9 @@
 package http_test
 
 import (
+	"github.com/wangluozhe/chttp"
 	"io/fs"
 	"log"
-	"net/http"
 	"strings"
 )
 

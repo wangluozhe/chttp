@@ -3,8 +3,8 @@ package http_test
 import (
 	"errors"
 	"fmt"
+	. "github.com/wangluozhe/chttp"
 	"io"
-	. "net/http"
 	"os"
 	"sync"
 	"testing"

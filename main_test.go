@@ -6,9 +6,9 @@ package http_test
 
 import (
 	"fmt"
+	"github.com/wangluozhe/chttp"
 	"io"
 	"log"
-	"net/http"
 	"os"
 	"runtime"
 	"sort"

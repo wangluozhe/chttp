@@ -7,9 +7,9 @@ package http_test
 import (
 	"bytes"
 	"fmt"
+	. "github.com/wangluozhe/chttp"
 	"io"
 	"log"
-	. "net/http"
 	"reflect"
 	"strconv"
 	"strings"

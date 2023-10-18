@@ -6,8 +6,8 @@ package h2c
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
+	tls "github.com/refraction-networking/utls"
 	"github.com/wangluozhe/chttp"
 	"github.com/wangluozhe/chttp/httptest"
 	"io"

@@ -7,9 +7,9 @@ package httptest_test
 import (
 	"fmt"
 	"github.com/wangluozhe/chttp"
-	"github.com/wangluozhe/chttp/httptest"
 	"io"
 	"log"
+	"net/http/httptest"
 )
 
 func ExampleResponseRecorder() {

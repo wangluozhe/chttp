@@ -8,7 +8,7 @@ package httptrace
 
 import (
 	"context"
-	"crypto/tls"
+	tls "github.com/refraction-networking/utls"
 	"github.com/wangluozhe/chttp/internal/nettrace"
 	"net"
 	"net/textproto"

@@ -8,7 +8,7 @@
 package http2
 
 import (
-	"crypto/tls"
+	tls "github.com/refraction-networking/utls"
 	"net"
 )
 

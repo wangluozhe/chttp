@@ -8,11 +8,11 @@ package http
 
 import (
 	"bytes"
-	"crypto/tls"
 	"errors"
+	tls "github.com/refraction-networking/utls"
+	"github.com/wangluozhe/chttp/internal/testcert"
 	"io"
 	"net"
-	"net/http/internal/testcert"
 	"strings"
 	"testing"
 )

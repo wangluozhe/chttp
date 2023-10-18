@@ -17,8 +17,8 @@ package http2 // import "github.com/wangluozhe/chttp/http2"
 
 import (
 	"bufio"
-	"crypto/tls"
 	"fmt"
+	tls "github.com/refraction-networking/utls"
 	"github.com/wangluozhe/chttp"
 	"io"
 	"os"

@@ -9,7 +9,7 @@ package http2
 
 import (
 	"context"
-	"crypto/tls"
+	tls "github.com/refraction-networking/utls"
 )
 
 // dialTLSWithContext opens a TLS connection.
