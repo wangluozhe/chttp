@@ -6,9 +6,9 @@ package httptrace_test
 
 import (
 	"fmt"
+	"github.com/wangluozhe/chttp"
+	"github.com/wangluozhe/chttp/httptrace"
 	"log"
-	"net/http"
-	"net/http/httptrace"
 )
 
 func Example() {

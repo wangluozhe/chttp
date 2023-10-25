@@ -6,10 +6,10 @@ package cookiejar_test
 
 import (
 	"fmt"
+	"github.com/wangluozhe/chttp"
+	"github.com/wangluozhe/chttp/cookiejar"
+	"github.com/wangluozhe/chttp/httptest"
 	"log"
-	"net/http"
-	"net/http/cookiejar"
-	"net/http/httptest"
 	"net/url"
 )
 

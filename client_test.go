@@ -16,7 +16,7 @@ import (
 	. "github.com/wangluozhe/chttp"
 	"github.com/wangluozhe/chttp/cookiejar"
 	"github.com/wangluozhe/chttp/httptest"
-	"internal/testenv"
+	"github.com/wangluozhe/chttp/internal/testenv"
 	"io"
 	"log"
 	"net"

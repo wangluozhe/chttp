@@ -1668,7 +1668,7 @@ func (cc *ClientConn) writeHeaders(streamID uint32, endStream bool, maxFrameSize
 		endHeaders := len(hdrs) == 0
 		if first {
 			headersPriorityParam := PriorityParam{}
-			if cc.t.HTTP2Settings.HeaderPriority != nil {
+			if cc.t.HTTP2Settings != nil && cc.t.HTTP2Settings.HeaderPriority != nil {
 				headersPriorityParam = *cc.t.HTTP2Settings.HeaderPriority
 			}
 			cc.fr.WriteHeaders(HeadersFrameParam{

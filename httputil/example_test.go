@@ -7,10 +7,10 @@ package httputil_test
 import (
 	"fmt"
 	"github.com/wangluozhe/chttp"
+	"github.com/wangluozhe/chttp/httptest"
+	"github.com/wangluozhe/chttp/httputil"
 	"io"
 	"log"
-	"net/http/httptest"
-	"net/http/httputil"
 	"net/url"
 	"strings"
 )

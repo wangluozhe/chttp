@@ -6,7 +6,7 @@ package cookiejar
 
 import (
 	"fmt"
-	"net/http"
+	"github.com/wangluozhe/chttp"
 	"net/url"
 	"sort"
 	"strings"

@@ -8,9 +8,9 @@ package cookiejar
 import (
 	"errors"
 	"fmt"
+	"github.com/wangluozhe/chttp"
+	"github.com/wangluozhe/chttp/internal/ascii"
 	"net"
-	"net/http"
-	"net/http/internal/ascii"
 	"net/url"
 	"sort"
 	"strings"
