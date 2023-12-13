@@ -40,6 +40,21 @@ const HeaderOrderKey = "Header-Order:"
 // Valid fields are :authority, :method, :path, :scheme
 const PHeaderOrderKey = "PHeader-Order:"
 
+// UnChangedHeaderKey does not require case conversion.
+// Header Key that do not need case conversion should be the same as those set
+const UnChangedHeaderKey = "UnChanged-HeaderKey:"
+
+func (h Header) inUnChangedHeaderKeys(key string) string {
+	if unChangedHeaderKey, ok := h[UnChangedHeaderKey]; ok {
+		for _, unKey := range unChangedHeaderKey {
+			if key == CanonicalHeaderKey(unKey) {
+				return unKey
+			}
+		}
+	}
+	return key
+}
+
 // Add adds the Key, value pair to the header.
 // It appends to any existing Values associated with Key.
 // The Key is case insensitive; it is canonicalized by
@@ -267,6 +282,7 @@ func (h Header) writeSubset(w io.Writer, exclude map[string]bool, trace *httptra
 		mutex.Lock()
 		exclude[HeaderOrderKey] = true
 		exclude[PHeaderOrderKey] = true
+		exclude[UnChangedHeaderKey] = true
 		mutex.Unlock()
 		kvs, sorter = h.SortedKeyValuesBy(order, exclude)
 	} else {
@@ -279,6 +295,7 @@ func (h Header) writeSubset(w io.Writer, exclude map[string]bool, trace *httptra
 			v = headerNewlineToSpace.Replace(v)
 			v = textproto.TrimString(v)
 			for _, s := range []string{kv.Key, ": ", v, "\r\n"} {
+				s = h.inUnChangedHeaderKeys(s)
 				if _, err := ws.WriteString(s); err != nil {
 					headerSorterPool.Put(sorter)
 					return err

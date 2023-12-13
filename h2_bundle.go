@@ -8920,7 +8920,7 @@ func (cc *http2ClientConn) encodeHeaders(req *Request, addGzipHeader bool, trail
 		if !httpguts.ValidHeaderFieldName(k) {
 			// If the header is magic key, the headers would have been ordered
 			// by this step. It is ok to delete and not raise an error
-			if k == HeaderOrderKey || k == PHeaderOrderKey {
+			if k == HeaderOrderKey || k == PHeaderOrderKey || k == UnChangedHeaderKey {
 				continue
 			}
 
@@ -9087,7 +9087,7 @@ func (cc *http2ClientConn) encodeHeaders(req *Request, addGzipHeader bool, trail
 	// Header list size is ok. Write the headers.
 	enumerateHeaders(func(name, value string) {
 		// skips over writing magic key headers
-		if name == PHeaderOrderKey || name == HeaderOrderKey {
+		if name == PHeaderOrderKey || name == HeaderOrderKey || name == UnChangedHeaderKey {
 			return
 		}
 
