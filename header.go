@@ -274,7 +274,7 @@ func (h Header) writeSubset(w io.Writer, exclude map[string]bool, trace *httptra
 	if headerOrder, ok := h[HeaderOrderKey]; ok {
 		order := make(map[string]int)
 		for i, v := range headerOrder {
-			order[v] = i
+			order[strings.ToLower(v)] = i
 		}
 		if exclude == nil {
 			exclude = make(map[string]bool)

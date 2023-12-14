@@ -2011,7 +2011,7 @@ func (cc *ClientConn) encodeHeaders(req *http.Request, addGzipHeader bool, trail
 		if headerOrder, ok := hdrs[http.HeaderOrderKey]; ok {
 			order := make(map[string]int)
 			for i, v := range headerOrder {
-				order[v] = i
+				order[strings.ToLower(v)] = i
 			}
 			kvs, _ = hdrs.SortedKeyValuesBy(order, make(map[string]bool))
 		} else {
