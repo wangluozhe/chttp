@@ -15,10 +15,10 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"github.com/wangluozhe/chttp"
+	"github.com/wangluozhe/chttp/httptest"
+	"github.com/wangluozhe/chttp/pprof"
 	"log"
-	"net/http"
-	"net/http/pprof"
-	"net/http/httptest"
 	"runtime"
 )
 

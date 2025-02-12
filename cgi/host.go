@@ -17,10 +17,10 @@ package cgi
 import (
 	"bufio"
 	"fmt"
+	"github.com/wangluozhe/chttp"
 	"io"
 	"log"
 	"net"
-	"net/http"
 	"net/textproto"
 	"os"
 	"os/exec"

@@ -13,10 +13,6 @@ const (
 	firefox = "firefox" //firefox User agent enum
 )
 
-type tlsExtensions interface {
-	StringToSpec(string, string) (*utls.ClientHelloSpec, error)
-}
-
 type TLSExtensions struct {
 	SupportedSignatureAlgorithms *utls.SignatureAlgorithmsExtension
 	CertCompressionAlgo          *utls.UtlsCompressCertExtension

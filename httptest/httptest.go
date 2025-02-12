@@ -10,8 +10,8 @@ import (
 	"bytes"
 	"context"
 	tls "github.com/refraction-networking/utls"
+	"github.com/wangluozhe/chttp"
 	"io"
-	"net/http"
 	"strings"
 )
 

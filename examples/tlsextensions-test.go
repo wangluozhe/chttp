@@ -414,8 +414,9 @@ func request(req *http.Request) {
 	}
 	h2ss := ToHTTP2Settings(h2s)
 	tls := utls.Config{
-		ClientSessionCache: utls.NewLRUClientSessionCache(100),
+		ClientSessionCache: utls.NewLRUClientSessionCache(0),
 		OmitEmptyPsk:       true,
+		//SessionTicketsDisabled: true, // Set to false when extension 41 exists
 	}
 	t1 := &http.Transport{
 		TLSClientConfig:   &tls,
