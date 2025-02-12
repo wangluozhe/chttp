@@ -1657,8 +1657,10 @@ func (pconn *persistConn) addTLS(ctx context.Context, name string, trace *httptr
 				pconn.t.TLSExtensions = &TLSExtensions{}
 			}
 			// KeyShare's Data was assigned after multiple requests were resolved
-			for i := range pconn.t.TLSExtensions.KeyShareCurves.KeyShares {
-				pconn.t.TLSExtensions.KeyShareCurves.KeyShares[i].Data = nil
+			if pconn.t.TLSExtensions.KeyShareCurves != nil {
+				for i := range pconn.t.TLSExtensions.KeyShareCurves.KeyShares {
+					pconn.t.TLSExtensions.KeyShareCurves.KeyShares[i].Data = nil
+				}
 			}
 
 			spec, err := pconn.t.TLSExtensions.StringToSpec(pconn.t.JA3, pconn.t.UserAgent)
