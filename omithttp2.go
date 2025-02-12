@@ -18,7 +18,7 @@ func init() {
 
 const noHTTP2 = "no bundled HTTP/2" // should never see this
 
-var http2errRequestCanceled = errors.New("net/http: request canceled")
+var http2errRequestCanceled = errors.New("github.com/wangluozhe/chttp: request canceled")
 
 var http2goAwayTimeout = 1 * time.Second
 
@@ -53,7 +53,7 @@ type http2clientConnIdleState struct {
 
 func (cc *http2clientConn) idleState() http2clientConnIdleState { return http2clientConnIdleState{} }
 
-func http2configureTransports(*Transport) (*http2Transport, error) { panic(noHTTP2) }
+func Http2ConfigureTransport(*Transport) (*http2Transport, error) { panic(noHTTP2) }
 
 func http2isNoCachedConnError(err error) bool {
 	_, ok := err.(interface{ IsHTTP2NoCachedConnError() })

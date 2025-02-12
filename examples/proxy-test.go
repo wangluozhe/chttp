@@ -4,14 +4,12 @@ import (
 	"fmt"
 	"github.com/wangluozhe/chttp"
 	"io"
+	"net/url"
 )
 
 func main() {
-	h1transport := &http.Transport{}
-	h2transport, err := http.HTTP2ConfigureTransports(h1transport)
-	h2transport.MaxDecoderHeaderTableSize = 65536
-	h1transport.H2Transport = h2transport
-	client := http.Client{Transport: h1transport}
+	proxyURL, _ := url.Parse("http://127.0.0.1:7890")
+	client := http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
 	req, err := http.NewRequest("GET", "https://tls.peet.ws/api/all", nil)
 	if err != nil {
 		fmt.Println(err)

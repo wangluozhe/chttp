@@ -5,17 +5,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/wangluozhe/chttp"
-	"github.com/wangluozhe/chttp/http2"
 	"io"
 )
 
-var settings = map[string]http2.SettingID{
-	"HEADER_TABLE_SIZE":      http2.SettingHeaderTableSize,
-	"ENABLE_PUSH":            http2.SettingEnablePush,
-	"MAX_CONCURRENT_STREAMS": http2.SettingMaxConcurrentStreams,
-	"INITIAL_WINDOW_SIZE":    http2.SettingInitialWindowSize,
-	"MAX_FRAME_SIZE":         http2.SettingMaxFrameSize,
-	"MAX_HEADER_LIST_SIZE":   http2.SettingMaxHeaderListSize,
+var settings = map[string]http.HTTP2SettingID{
+	"HEADER_TABLE_SIZE":      http.HTTP2SettingHeaderTableSize,
+	"ENABLE_PUSH":            http.HTTP2SettingEnablePush,
+	"MAX_CONCURRENT_STREAMS": http.HTTP2SettingMaxConcurrentStreams,
+	"INITIAL_WINDOW_SIZE":    http.HTTP2SettingInitialWindowSize,
+	"MAX_FRAME_SIZE":         http.HTTP2SettingMaxFrameSize,
+	"MAX_HEADER_LIST_SIZE":   http.HTTP2SettingMaxHeaderListSize,
 }
 
 type H2Settings struct {
@@ -38,11 +37,11 @@ type H2Settings struct {
 	PriorityFrames []map[string]interface{} `json:"PriorityFrames"`
 }
 
-func ToHTTP2Settings(h2Settings *H2Settings) (http2Settings *http2.HTTP2Settings) {
-	http2Settings = &http2.HTTP2Settings{
+func ToHTTP2Settings(h2Settings *H2Settings) (http2Settings *http.HTTP2Settings) {
+	http2Settings = &http.HTTP2Settings{
 		Settings:       nil,
 		ConnectionFlow: 0,
-		HeaderPriority: &http2.PriorityParam{},
+		HeaderPriority: &http.HTTP2PriorityParam{},
 		PriorityFrames: nil,
 	}
 	if h2Settings.Settings != nil {
@@ -50,7 +49,7 @@ func ToHTTP2Settings(h2Settings *H2Settings) (http2Settings *http2.HTTP2Settings
 			for _, orderKey := range h2Settings.SettingsOrder {
 				val := h2Settings.Settings[orderKey]
 				if val != 0 || orderKey == "ENABLE_PUSH" {
-					http2Settings.Settings = append(http2Settings.Settings, http2.Setting{
+					http2Settings.Settings = append(http2Settings.Settings, http.HTTP2Setting{
 						ID:  settings[orderKey],
 						Val: uint32(val),
 					})
@@ -58,7 +57,7 @@ func ToHTTP2Settings(h2Settings *H2Settings) (http2Settings *http2.HTTP2Settings
 			}
 		} else {
 			for id, val := range h2Settings.Settings {
-				http2Settings.Settings = append(http2Settings.Settings, http2.Setting{
+				http2Settings.Settings = append(http2Settings.Settings, http.HTTP2Setting{
 					ID:  settings[id],
 					Val: uint32(val),
 				})
@@ -85,14 +84,14 @@ func ToHTTP2Settings(h2Settings *H2Settings) (http2Settings *http2.HTTP2Settings
 		case float64:
 			streamDep = int(s.(float64))
 		}
-		var priorityParam *http2.PriorityParam
+		var priorityParam *http.HTTP2PriorityParam
 		if w == nil {
-			priorityParam = &http2.PriorityParam{
+			priorityParam = &http.HTTP2PriorityParam{
 				StreamDep: uint32(streamDep),
 				Exclusive: h2Settings.HeaderPriority["exclusive"].(bool),
 			}
 		} else {
-			priorityParam = &http2.PriorityParam{
+			priorityParam = &http.HTTP2PriorityParam{
 				StreamDep: uint32(streamDep),
 				Exclusive: h2Settings.HeaderPriority["exclusive"].(bool),
 				Weight:    uint8(weight - 1),
@@ -127,24 +126,24 @@ func ToHTTP2Settings(h2Settings *H2Settings) (http2Settings *http2.HTTP2Settings
 			case float64:
 				streamID = int(sid.(float64))
 			}
-			var priorityParam http2.PriorityParam
+			var priorityParam http.HTTP2PriorityParam
 			if w == nil {
-				priorityParam = http2.PriorityParam{
+				priorityParam = http.HTTP2PriorityParam{
 					StreamDep: uint32(streamDep),
 					Exclusive: priorityParamSource["exclusive"].(bool),
 				}
 			} else {
-				priorityParam = http2.PriorityParam{
+				priorityParam = http.HTTP2PriorityParam{
 					StreamDep: uint32(streamDep),
 					Exclusive: priorityParamSource["exclusive"].(bool),
 					Weight:    uint8(weight - 1),
 				}
 			}
-			http2Settings.PriorityFrames = append(http2Settings.PriorityFrames, http2.PriorityFrame{
-				FrameHeader: http2.FrameHeader{
+			http2Settings.PriorityFrames = append(http2Settings.PriorityFrames, http.HTTP2PriorityFrame{
+				HTTP2FrameHeader: http.HTTP2FrameHeader{
 					StreamID: uint32(streamID),
 				},
-				PriorityParam: priorityParam,
+				HTTP2PriorityParam: priorityParam,
 			})
 		}
 	}
@@ -181,7 +180,14 @@ func request(req *http.Request) {
 		},
 	}
 	h2ss := ToHTTP2Settings(h2s)
-	client := http.Client{Transport: &http2.Transport{HTTP2Settings: h2ss}}
+	t1 := &http.Transport{}
+	t2, err := http.HTTP2ConfigureTransports(t1)
+	if err != nil {
+		fmt.Println(err)
+	}
+	t2.HTTP2Settings = h2ss
+	t1.H2Transport = t2
+	client := http.Client{Transport: t1}
 	resp, _ := client.Do(req)
 	text, _ := io.ReadAll(resp.Body)
 	fmt.Println(string(text))
