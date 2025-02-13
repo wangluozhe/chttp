@@ -43,6 +43,8 @@ func parseUserAgent(userAgent string) string {
 	switch {
 	case strings.Contains(strings.ToLower(userAgent), "chrome"):
 		return chrome
+	case strings.Contains(strings.ToLower(userAgent), "applewebkit"):
+		return chrome
 	case strings.Contains(strings.ToLower(userAgent), "firefox"):
 		return firefox
 	default:
@@ -162,10 +164,14 @@ func (tlsExtensions *TLSExtensions) StringToSpec(ja3 string, userAgent string) (
 			return nil, raiseExtensionError(e)
 		}
 		// //Optionally add Chrome Grease Extension
-		if e == "21" && parsedUserAgent == chrome && !tlsExtensions.NotUsedGREASE {
+		if e == "41" && parsedUserAgent == chrome && !tlsExtensions.NotUsedGREASE {
 			exts = append(exts, &utls.UtlsGREASEExtension{})
 		}
 		exts = append(exts, te)
+	}
+
+	if parsedUserAgent == chrome && strings.Index(strings.Split(ja3, ",")[2], "-41") == -1 {
+		exts = append(exts, &utls.UtlsGREASEExtension{})
 	}
 
 	// build CipherSuites
