@@ -139,9 +139,7 @@ func (tlsExtensions *TLSExtensions) StringToSpec(ja3 string, userAgent string) (
 			extMap["50"] = ext.SignatureAlgorithmsCert
 		}
 		if ext.KeyShareCurves != nil {
-			if strings.Index(strings.Split(ja3, ",")[2], "-41") == -1 {
-				extMap["51"] = ext.KeyShareCurves
-			}
+			extMap["51"] = ext.KeyShareCurves
 		}
 	}
 
