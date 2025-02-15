@@ -1660,7 +1660,7 @@ func (pconn *persistConn) addTLS(ctx context.Context, name string, trace *httptr
 			if pconn.t.TLSExtensions.KeyShareCurves != nil {
 				for i := range pconn.t.TLSExtensions.KeyShareCurves.KeyShares {
 					if pconn.t.TLSExtensions.KeyShareCurves.KeyShares[i].Group != 0x0a0a {
-						pconn.t.TLSExtensions.KeyShareCurves.KeyShares[i].Data = nil
+						pconn.t.TLSExtensions.KeyShareCurves.KeyShares[i].Data = []byte{0}
 					}
 				}
 			}
