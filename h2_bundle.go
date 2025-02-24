@@ -9272,18 +9272,17 @@ func (cc *http2ClientConn) encodeHeaders(req *Request, addGzipHeader bool, trail
 			//	// Host is :authority, already sent.
 			//	// Content-Length is automatic, set below.
 			//	continue
-			//} else if http2asciiEqualFold(kv.key, "connection") ||
-			//	http2asciiEqualFold(kv.key, "proxy-connection") ||
-			//	http2asciiEqualFold(kv.key, "transfer-encoding") ||
-			//	http2asciiEqualFold(kv.key, "upgrade") ||
-			//	http2asciiEqualFold(kv.key, "keep-alive") {
-			//	// Per 8.1.2.2 Connection-Specific Header
-			//	// Fields, don't send connection-specific
-			//	// fields. We have already checked if any
-			//	// are error-worthy so just ignore the rest.
-			//	continue
-			//} else if http2asciiEqualFold(kv.key, "user-agent") {
-			if http2asciiEqualFold(kv.key, "user-agent") {
+			if http2asciiEqualFold(kv.key, "connection") ||
+				http2asciiEqualFold(kv.key, "proxy-connection") ||
+				http2asciiEqualFold(kv.key, "transfer-encoding") ||
+				http2asciiEqualFold(kv.key, "upgrade") ||
+				http2asciiEqualFold(kv.key, "keep-alive") {
+				// Per 8.1.2.2 Connection-Specific Header
+				// Fields, don't send connection-specific
+				// fields. We have already checked if any
+				// are error-worthy so just ignore the rest.
+				continue
+			} else if http2asciiEqualFold(kv.key, "user-agent") {
 				// Match Go's http1 behavior: at most one
 				// User-Agent. If set to nil or empty string,
 				// then omit it. Otherwise if not mentioned,
@@ -9301,19 +9300,19 @@ func (cc *http2ClientConn) encodeHeaders(req *Request, addGzipHeader bool, trail
 				// Cookie header field MAY be split into separate header fields,
 				// each with one or more cookie-pairs.
 				for _, v := range kv.values {
-					for {
-						p := strings.IndexByte(v, ';')
-						if p < 0 {
-							break
-						}
-						f("cookie", v[:p])
-						p++
-						// strip space after semicolon if any.
-						for p+1 <= len(v) && v[p] == ' ' {
-							p++
-						}
-						v = v[p:]
-					}
+					//for {
+					//	p := strings.IndexByte(v, ';')
+					//	if p < 0 {
+					//		break
+					//	}
+					//	f("cookie", v[:p])
+					//	p++
+					//	// strip space after semicolon if any.
+					//	for p+1 <= len(v) && v[p] == ' ' {
+					//		p++
+					//	}
+					//	v = v[p:]
+					//}
 					if len(v) > 0 {
 						f("cookie", v)
 					}

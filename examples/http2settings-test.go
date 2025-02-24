@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"github.com/wangluozhe/chttp"
 	"io"
-	"net"
 	"net/url"
 	"strings"
 )
@@ -18,6 +17,8 @@ var settings = map[string]http.HTTP2SettingID{
 	"INITIAL_WINDOW_SIZE":    http.HTTP2SettingInitialWindowSize,
 	"MAX_FRAME_SIZE":         http.HTTP2SettingMaxFrameSize,
 	"MAX_HEADER_LIST_SIZE":   http.HTTP2SettingMaxHeaderListSize,
+	"UNKNOWN_SETTING_8":      http.HTTP2SettingID(8),
+	"NO_RFC7540_PRIORITIES":  http.HTTP2SettingID(9),
 }
 
 type H2Settings struct {
@@ -168,6 +169,8 @@ func request(req *http.Request) {
 			"MAX_HEADER_LIST_SIZE": 262144,
 			//"MAX_CONCURRENT_STREAMS": 1000,
 			//"MAX_FRAME_SIZE":         16384,
+			"UNKNOWN_SETTING_8":     1,
+			"NO_RFC7540_PRIORITIES": 1,
 		},
 		SettingsOrder: []string{
 			"HEADER_TABLE_SIZE",
@@ -176,6 +179,8 @@ func request(req *http.Request) {
 			"MAX_HEADER_LIST_SIZE",
 			//"MAX_CONCURRENT_STREAMS",
 			//"MAX_FRAME_SIZE",
+			"UNKNOWN_SETTING_8",
+			"NO_RFC7540_PRIORITIES",
 		},
 		ConnectionFlow: 15663105,
 		HeaderPriority: map[string]interface{}{

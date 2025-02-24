@@ -226,11 +226,6 @@ var keyShareCurvesExtensions = map[string]utls.KeyShare{
 	"P384":   utls.KeyShare{Group: utls.CurveP384},
 	"P521":   utls.KeyShare{Group: utls.CurveP521},
 	"X25519": utls.KeyShare{Group: utls.X25519},
-	"4588":   utls.KeyShare{Group: utls.CurveID(0x6399)},
-	"25529":  utls.KeyShare{Group: utls.CurveID(0x6399)},
-	"65072":  utls.KeyShare{Group: utls.CurveID(0xfe30)},
-	"65073":  utls.KeyShare{Group: utls.CurveID(0xfe31)},
-	"65074":  utls.KeyShare{Group: utls.CurveID(0xfe32)},
 }
 
 type Extensions struct {
@@ -378,7 +373,7 @@ func ToTLSExtensions(e *Extensions) (extensions *http.TLSExtensions) {
 				if err != nil {
 					continue
 				}
-				extensions.KeyShareCurves.KeyShares = append(extensions.KeyShareCurves.KeyShares, utls.KeyShare{Group: utls.CurveID(curveID)})
+				extensions.KeyShareCurves.KeyShares = append(extensions.KeyShareCurves.KeyShares, utls.KeyShare{Group: utls.CurveID(curveID), Data: []byte{0}})
 			}
 		}
 	}
@@ -395,24 +390,24 @@ func main() {
 func request(req *http.Request) {
 	h2s := &H2Settings{
 		Settings: map[string]int{
-			"HEADER_TABLE_SIZE":   65536,
+			//"HEADER_TABLE_SIZE":    65536,
 			"ENABLE_PUSH":         0,
-			"INITIAL_WINDOW_SIZE": 131072,
+			"INITIAL_WINDOW_SIZE": 2097152,
 			//"MAX_HEADER_LIST_SIZE": 262144,
-			//"MAX_CONCURRENT_STREAMS": 1000,
-			"MAX_FRAME_SIZE": 16384,
+			"MAX_CONCURRENT_STREAMS": 100,
+			//"MAX_FRAME_SIZE":         16384,
 		},
 		SettingsOrder: []string{
-			"HEADER_TABLE_SIZE",
+			//"HEADER_TABLE_SIZE",
 			"ENABLE_PUSH",
 			"INITIAL_WINDOW_SIZE",
 			//"MAX_HEADER_LIST_SIZE",
-			//"MAX_CONCURRENT_STREAMS",
-			"MAX_FRAME_SIZE",
+			"MAX_CONCURRENT_STREAMS",
+			//"MAX_FRAME_SIZE",
 		},
-		ConnectionFlow: 12517377,
+		ConnectionFlow: 10485760,
 		HeaderPriority: map[string]interface{}{
-			"weight":    42,
+			"weight":    255,
 			"streamDep": 0,
 			"exclusive": false,
 		},
@@ -433,45 +428,47 @@ func request(req *http.Request) {
 	}
 	t2.HTTP2Settings = h2ss
 	t1.H2Transport = t2
-	t1.JA3 = "771,4865-4867-4866-49195-49199-52393-52392-49196-49200-49162-49161-49171-49172-156-157-47-53,51-10-23-34-65281-13-18-35-11-27-43-5-0-45-16-65037-28-41,4588-29-23-24-25-256-257,0"
+	t1.JA3 = "771,4865-4866-4867-49196-49195-52393-49200-49199-52392-49162-49161-49172-49171-157-156-53-47-49160-49170-10,0-23-65281-10-11-16-5-13-18-51-45-43-27-21,29-23-24-25,0"
 	es := &Extensions{
 		SupportedSignatureAlgorithms: []string{
 			"ECDSAWithP256AndSHA256",
-			"ECDSAWithP384AndSHA384",
-			"ECDSAWithP521AndSHA512",
 			"PSSWithSHA256",
-			"PSSWithSHA384",
-			"PSSWithSHA512",
 			"PKCS1WithSHA256",
-			"PKCS1WithSHA384",
-			"PKCS1WithSHA512",
+			"ECDSAWithP384AndSHA384",
 			"ECDSAWithSHA1",
+			"PSSWithSHA384",
+			"PKCS1WithSHA384",
+			"ECDSAWithP521AndSHA512",
+			"PSSWithSHA512",
+			"PKCS1WithSHA512",
 			"PKCS1WithSHA1",
 		},
 		CertCompressionAlgo: []string{
 			"zlib",
-			"brotli",
-			"zstd",
 		},
-		RecordSizeLimit: 4001,
-		DelegatedCredentials: []string{
-			"ECDSAWithP256AndSHA256",
-			"ECDSAWithP384AndSHA384",
-			"ECDSAWithP521AndSHA512",
-			"ECDSAWithSHA1",
-		},
+		//RecordSizeLimit: 4001,
+		//DelegatedCredentials: []string{
+		//	"ECDSAWithP256AndSHA256",
+		//	"ECDSAWithP384AndSHA384",
+		//	"ECDSAWithP521AndSHA512",
+		//	"ECDSAWithSHA1",
+		//},
 		SupportedVersions: []string{
+			"GREASE",
 			"1.3",
 			"1.2",
+			"1.1",
+			"1.0",
 		},
 		PSKKeyExchangeModes: []string{
 			"PskModeDHE",
 		},
 		KeyShareCurves: []string{
-			"65074",
+			"GREASE",
 			"X25519",
-			"P256",
+			//"P256",
 		},
+		NotUsedGREASE: false,
 	}
 	tes := ToTLSExtensions(es)
 	t1.TLSExtensions = tes
@@ -500,25 +497,20 @@ func get() {
 	rawurl := "https://tls.peet.ws/api/all"
 	req, _ := http.NewRequest("GET", rawurl, nil)
 	headers := http.Header{
-		"User-Agent":                []string{"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36 Edg/117.0.2045.60"},
-		"accept":                    []string{"text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"},
-		"accept-language":           []string{"zh-CN,zh;q=0.8,zh-TW;q=0.7,zh-HK;q=0.5,en-US;q=0.3,en;q=0.2"},
-		"Accept-Encoding":           []string{"gzip, deflate, br"},
-		"upgrade-insecure-requests": []string{"1"},
-		"sec-fetch-dest":            []string{"document"},
-		"sec-fetch-mode":            []string{"navigate"},
-		"sec-fetch-site":            []string{"none"},
-		"sec-fetch-user":            []string{"?1"},
-		"te":                        []string{"trailers"},
-		"cookie":                    []string{"_abck=123; bm_sz=321"},
+		"User-Agent":      []string{"Mozilla/5.0 (iPhone; CPU iPhone OS 18_1_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.56(0x18003830) NetType/WIFI Language/zh_CN"},
+		"accept":          []string{"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
+		"accept-language": []string{"zh-CN,zh-Hans;q=0.9"},
+		"accept-encoding": []string{"gzip, deflate, br"},
+		"sec-fetch-dest":  []string{"document"},
+		"sec-fetch-mode":  []string{"navigate"},
+		"sec-fetch-site":  []string{"none"},
 		http.PHeaderOrderKey: []string{
 			":method",
+			":scheme",
 			":path",
 			":authority",
-			":scheme",
 		},
 		http.HeaderOrderKey: []string{
-			"cookie",
 			"user-agent",
 			"accept",
 			"accept-language",
