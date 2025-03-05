@@ -23,6 +23,7 @@ type TLSExtensions struct {
 	SignatureAlgorithmsCert      *utls.SignatureAlgorithmsCertExtension
 	KeyShareCurves               *utls.KeyShareExtension
 	NotUsedGREASE                bool
+	ClientHelloHexStream         string
 }
 
 type errExtensionNotExist struct {
@@ -279,7 +280,7 @@ func genMap() (extMap map[string]utls.TLSExtension) {
 				"h2",
 			},
 		},
-		"17613": &utls.ApplicationSettingsExtension{
+		"17613": &utls.ApplicationSettingsExtensionNew{
 			SupportedProtocols: []string{
 				"h2",
 			},

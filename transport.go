@@ -14,6 +14,7 @@ import (
 	"compress/gzip"
 	"container/list"
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	tls "github.com/refraction-networking/utls"
@@ -298,6 +299,9 @@ type Transport struct {
 	JA3           string
 	UserAgent     string
 	TLSExtensions *TLSExtensions
+
+	// Wireshark ClientHello hex stream
+	ClientHelloHexStream string
 }
 
 func (t *Transport) writeBufferSize() int {
@@ -1650,32 +1654,57 @@ func (pconn *persistConn) addTLS(ctx context.Context, name string, trace *httptr
 	tlscfg := cfg.Clone()
 	var tlsConn *tls.UConn
 
-	if pconn.t.JA3 != "" {
+	if pconn.t.TLSExtensions == nil {
+		pconn.t.TLSExtensions = &TLSExtensions{}
+	}
+
+	if pconn.t.TLSExtensions.ClientHelloHexStream != "" {
+		if strings.Index(pconn.t.TLSExtensions.ClientHelloHexStream, "0029") == -1 {
+			tlscfg.SessionTicketsDisabled = true
+		}
 		tlsConn = tls.UClient(plainConn, tlscfg, tls.HelloCustom)
-		if pconn.t.JA3 != "" {
-			if pconn.t.TLSExtensions == nil {
-				pconn.t.TLSExtensions = &TLSExtensions{}
-			}
-			// KeyShare's Data was assigned after multiple requests were resolved
-			if pconn.t.TLSExtensions.KeyShareCurves != nil {
-				for i := range pconn.t.TLSExtensions.KeyShareCurves.KeyShares {
-					v := pconn.t.TLSExtensions.KeyShareCurves.KeyShares[i].Group
-					if ((v >> 8) == v&0xff) && v&0xf == 0xa {
-						pconn.t.TLSExtensions.KeyShareCurves.KeyShares[i].Data = []byte{0}
-					} else {
-						pconn.t.TLSExtensions.KeyShareCurves.KeyShares[i].Data = nil
-					}
+
+		clientHelloHexStreamBytes := []byte(pconn.t.TLSExtensions.ClientHelloHexStream)
+		clientHelloBytes := make([]byte, hex.DecodedLen(len(clientHelloHexStreamBytes)))
+		_, err := hex.Decode(clientHelloBytes, clientHelloHexStreamBytes)
+		if err != nil {
+			return errors.New(fmt.Sprintf("got error: %v; expected to succeed", err))
+		}
+
+		f := &tls.Fingerprinter{
+			AllowBluntMimicry: true,
+			RealPSKResumption: true,
+		}
+		spec, err := f.FingerprintClientHello(clientHelloBytes)
+		if err != nil {
+			return errors.New(fmt.Sprintf("got error: %v; expected to succeed", err))
+		}
+
+		if err := tlsConn.ApplyPreset(spec); err != nil {
+			return err
+		}
+	} else if pconn.t.JA3 != "" {
+		tlsConn = tls.UClient(plainConn, tlscfg, tls.HelloCustom)
+
+		// KeyShare's Data was assigned after multiple requests were resolved
+		if pconn.t.TLSExtensions.KeyShareCurves != nil {
+			for i := range pconn.t.TLSExtensions.KeyShareCurves.KeyShares {
+				v := pconn.t.TLSExtensions.KeyShareCurves.KeyShares[i].Group
+				if ((v >> 8) == v&0xff) && v&0xf == 0xa {
+					pconn.t.TLSExtensions.KeyShareCurves.KeyShares[i].Data = []byte{0}
+				} else {
+					pconn.t.TLSExtensions.KeyShareCurves.KeyShares[i].Data = nil
 				}
 			}
+		}
 
-			spec, err := pconn.t.TLSExtensions.StringToSpec(pconn.t.JA3, pconn.t.UserAgent)
-			if err != nil {
-				return err
-			}
+		spec, err := pconn.t.TLSExtensions.StringToSpec(pconn.t.JA3, pconn.t.UserAgent)
+		if err != nil {
+			return err
+		}
 
-			if err := tlsConn.ApplyPreset(spec); err != nil {
-				return err
-			}
+		if err := tlsConn.ApplyPreset(spec); err != nil {
+			return err
 		}
 	} else {
 		tlsConn = tls.UClient(plainConn, tlscfg, tls.HelloGolang)
