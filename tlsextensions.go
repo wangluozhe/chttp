@@ -169,7 +169,7 @@ func (tlsExtensions *TLSExtensions) StringToSpec(ja3 string, userAgent string) (
 		exts = append(exts, te)
 	}
 
-	if parsedUserAgent == chrome && (extensions[len(extensions)-1] != "21" && extensions[len(extensions)-1] != "41") {
+	if parsedUserAgent == chrome && (extensions[len(extensions)-1] != "21" && extensions[len(extensions)-1] != "41") && !tlsExtensions.NotUsedGREASE {
 		exts = append(exts, &utls.UtlsGREASEExtension{})
 	}
 

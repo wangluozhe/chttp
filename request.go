@@ -101,6 +101,9 @@ var reqWriteExcludeHeader = map[string]bool{
 	//"Content-Length":    true,
 	//"Transfer-Encoding": true,
 	//"Trailer":           true,
+	HeaderOrderKey:     true,
+	PHeaderOrderKey:    true,
+	UnChangedHeaderKey: true,
 }
 
 // A Request represents an HTTP request received by a server
