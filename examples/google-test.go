@@ -5,6 +5,7 @@ import (
 	utls "github.com/refraction-networking/utls"
 	http "github.com/wangluozhe/chttp"
 	"io"
+	//"net/url"
 
 	"strconv"
 )
@@ -390,26 +391,26 @@ func main() {
 func request(req *http.Request) {
 	h2s := &H2Settings{
 		Settings: map[string]int{
-			//"HEADER_TABLE_SIZE":    65536,
-			"ENABLE_PUSH":         0,
-			"INITIAL_WINDOW_SIZE": 2147483647,
-			//"MAX_HEADER_LIST_SIZE": 262144,
-			"MAX_CONCURRENT_STREAMS": 100,
+			"HEADER_TABLE_SIZE":    65536,
+			"ENABLE_PUSH":          0,
+			"INITIAL_WINDOW_SIZE":  6291456,
+			"MAX_HEADER_LIST_SIZE": 262144,
+			//"MAX_CONCURRENT_STREAMS": 1000,
 			//"MAX_FRAME_SIZE":         16384,
 		},
 		SettingsOrder: []string{
-			//"HEADER_TABLE_SIZE",
+			"HEADER_TABLE_SIZE",
 			"ENABLE_PUSH",
 			"INITIAL_WINDOW_SIZE",
-			//"MAX_HEADER_LIST_SIZE",
-			"MAX_CONCURRENT_STREAMS",
+			"MAX_HEADER_LIST_SIZE",
+			//"MAX_CONCURRENT_STREAMS",
 			//"MAX_FRAME_SIZE",
 		},
-		ConnectionFlow: 1073741823,
+		ConnectionFlow: 15663105,
 		HeaderPriority: map[string]interface{}{
-			"weight":    255,
+			"weight":    256,
 			"streamDep": 0,
-			"exclusive": false,
+			"exclusive": true,
 		},
 	}
 	h2ss := ToHTTP2Settings(h2s)
@@ -418,33 +419,34 @@ func request(req *http.Request) {
 		OmitEmptyPsk:       true,
 		//SessionTicketsDisabled: true, // Set to false when extension 41 exists
 	}
+	//proxyUrl, _ := url.Parse("http://127.0.0.1:8888")
 	t1 := &http.Transport{
 		TLSClientConfig:   &tls,
 		DisableKeepAlives: false,
+		//Proxy:             http.ProxyURL(proxyUrl),
 	}
 	t2, err := http.HTTP2ConfigureTransports(t1)
+	t2.MaxEncoderHeaderTableSize = 65536
+	t2.MaxDecoderHeaderTableSize = 65536
 	if err != nil {
 		fmt.Println(err)
 	}
 	t2.HTTP2Settings = h2ss
 	t1.H2Transport = t2
-	t1.JA3 = "771,4865-4866-4867-49196-49195-52393-49200-49199-52392-49162-49161-49172-49171-157-156-53-47-49160-49170-10,0-23-65281-10-11-16-5-13-18-51-45-43-27-21,29-23-24-25,0"
+	t1.JA3 = "771,4865-4866-4867-49195-49199-49196-49200-52393-52392-49171-49172-156-157-47-53,45-5-10-0-43-35-17613-23-18-65037-11-13-16-27-65281-51-41,4588-29-23-24,0"
 	es := &Extensions{
 		SupportedSignatureAlgorithms: []string{
 			"ECDSAWithP256AndSHA256",
 			"PSSWithSHA256",
 			"PKCS1WithSHA256",
 			"ECDSAWithP384AndSHA384",
-			"ECDSAWithSHA1",
 			"PSSWithSHA384",
 			"PKCS1WithSHA384",
-			"ECDSAWithP521AndSHA512",
 			"PSSWithSHA512",
 			"PKCS1WithSHA512",
-			"PKCS1WithSHA1",
 		},
 		CertCompressionAlgo: []string{
-			"zlib",
+			"brotli",
 		},
 		//RecordSizeLimit: 4001,
 		//DelegatedCredentials: []string{
@@ -457,18 +459,15 @@ func request(req *http.Request) {
 			"GREASE",
 			"1.3",
 			"1.2",
-			"1.1",
-			"1.0",
 		},
 		PSKKeyExchangeModes: []string{
 			"PskModeDHE",
 		},
 		KeyShareCurves: []string{
 			"GREASE",
+			"4588",
 			"X25519",
-			//"P256",
 		},
-		NotUsedGREASE: false,
 	}
 	tes := ToTLSExtensions(es)
 	t1.TLSExtensions = tes
@@ -494,21 +493,25 @@ func request(req *http.Request) {
 }
 
 func get() {
-	rawurl := "https://tls.peet.ws/api/all"
+	rawurl := "https://www.google.com/recaptcha/api.js?render=6LcR_okUAAAAAPYrPe-HK_0RULO1aZM15ENyM-Mf"
+	//rawurl := "https://tls.peet.ws/api/all"
 	req, _ := http.NewRequest("GET", rawurl, nil)
 	headers := http.Header{
-		"User-Agent":      []string{"Mozilla/5.0 (iPhone; CPU iPhone OS 18_1_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.56(0x18003830) NetType/WIFI Language/zh_CN"},
-		"accept":          []string{"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
-		"accept-language": []string{"zh-CN,zh-Hans;q=0.9"},
-		"accept-encoding": []string{"gzip, deflate, br"},
-		"sec-fetch-dest":  []string{"document"},
-		"sec-fetch-mode":  []string{"navigate"},
-		"sec-fetch-site":  []string{"none"},
+		"User-Agent":                []string{"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36 Edg/117.0.2045.60"},
+		"accept":                    []string{"text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"},
+		"accept-language":           []string{"zh-CN,zh;q=0.8,zh-TW;q=0.7,zh-HK;q=0.5,en-US;q=0.3,en;q=0.2"},
+		"accept-encoding":           []string{"gzip, deflate, br"},
+		"upgrade-insecure-requests": []string{"1"},
+		"sec-fetch-dest":            []string{"document"},
+		"sec-fetch-mode":            []string{"navigate"},
+		"sec-fetch-site":            []string{"none"},
+		"sec-fetch-user":            []string{"?1"},
+		"te":                        []string{"trailers"},
 		http.PHeaderOrderKey: []string{
 			":method",
+			":authority",
 			":scheme",
 			":path",
-			":authority",
 		},
 		http.HeaderOrderKey: []string{
 			"user-agent",
