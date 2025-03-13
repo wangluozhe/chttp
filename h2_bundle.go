@@ -4164,9 +4164,9 @@ func http2ConfigureServer(s *Server, conf *http2Server) error {
 	}
 
 	if s.TLSNextProto == nil {
-		s.TLSNextProto = map[string]func(*Server, *tls.UConn, Handler){}
+		s.TLSNextProto = map[string]func(*Server, *tls.Conn, Handler){}
 	}
-	protoHandler := func(hs *Server, c *tls.UConn, h Handler) {
+	protoHandler := func(hs *Server, c *tls.Conn, h Handler) {
 		if http2testHookOnConn != nil {
 			http2testHookOnConn()
 		}
@@ -8029,7 +8029,7 @@ func (t *HTTP2Transport) newClientConn(c net.Conn, singleUse bool) (*http2Client
 				cc.nextStreamID = frame.StreamID + uint32(2)
 			}
 		}
-		cc.inflow.add(inflowValue + connectionFlow)
+		cc.inflow.init(int32(inflowValue + connectionFlow))
 	} else {
 		cc.fr.WriteSettings(initialSettings...)
 		cc.fr.WriteWindowUpdate(0, http2transportDefaultConnFlow)
