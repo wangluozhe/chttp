@@ -3,9 +3,10 @@ package http
 import (
 	"crypto/sha256"
 	"fmt"
-	utls "github.com/refraction-networking/utls"
 	"strconv"
 	"strings"
+
+	utls "github.com/refraction-networking/utls"
 )
 
 const (
@@ -55,7 +56,7 @@ func parseUserAgent(userAgent string) string {
 }
 
 // StringToSpec creates a ClientHelloSpec based on a JA3 string
-func (tlsExtensions *TLSExtensions) StringToSpec(ja3 string, userAgent string) (*utls.ClientHelloSpec, error) {
+func (tlsExtensions *TLSExtensions) StringToSpec(ja3 string, userAgent string, forceHTTP1 bool) (*utls.ClientHelloSpec, error) {
 	parsedUserAgent := parseUserAgent(userAgent)
 	if tlsExtensions == nil {
 		tlsExtensions = &TLSExtensions{}
@@ -115,6 +116,13 @@ func (tlsExtensions *TLSExtensions) StringToSpec(ja3 string, userAgent string) (
 		targetPointFormats = append(targetPointFormats, byte(pid))
 	}
 	extMap["11"] = &utls.SupportedPointsExtension{SupportedPoints: targetPointFormats}
+
+	// force http1
+	if forceHTTP1 {
+		extMap["16"] = &utls.ALPNExtension{
+			AlpnProtocols: []string{"http/1.1"},
+		}
+	}
 
 	// custom tls extensions
 	if tlsExtensions != nil {

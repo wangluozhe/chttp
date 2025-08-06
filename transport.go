@@ -17,10 +17,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	tls "github.com/refraction-networking/utls"
-	"github.com/wangluozhe/chttp/httptrace"
-	"github.com/wangluozhe/chttp/internal/ascii"
-	"github.com/wangluozhe/chttp/internal/godebug"
 	"io"
 	"log"
 	"net"
@@ -32,6 +28,11 @@ import (
 	"sync/atomic"
 	"time"
 	_ "unsafe"
+
+	tls "github.com/refraction-networking/utls"
+	"github.com/wangluozhe/chttp/httptrace"
+	"github.com/wangluozhe/chttp/internal/ascii"
+	"github.com/wangluozhe/chttp/internal/godebug"
 
 	"golang.org/x/net/http/httpguts"
 	"golang.org/x/net/http/httpproxy"
@@ -299,6 +300,7 @@ type Transport struct {
 	JA3           string
 	UserAgent     string
 	TLSExtensions *TLSExtensions
+	ForceHTTP1    bool
 
 	// Wireshark ClientHello hex stream
 	ClientHelloHexStream string
@@ -1698,7 +1700,7 @@ func (pconn *persistConn) addTLS(ctx context.Context, name string, trace *httptr
 			}
 		}
 
-		spec, err := pconn.t.TLSExtensions.StringToSpec(pconn.t.JA3, pconn.t.UserAgent)
+		spec, err := pconn.t.TLSExtensions.StringToSpec(pconn.t.JA3, pconn.t.UserAgent, pconn.t.ForceHTTP1)
 		if err != nil {
 			return err
 		}
