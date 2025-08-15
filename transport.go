@@ -1661,13 +1661,18 @@ func (pconn *persistConn) addTLS(ctx context.Context, name string, trace *httptr
 		pconn.t.TLSExtensions = &TLSExtensions{}
 	}
 
-	if pconn.t.TLSExtensions.ClientHelloHexStream != "" {
-		if strings.Index(pconn.t.TLSExtensions.ClientHelloHexStream, "0029") == -1 {
+	tlsExtensions, err := pconn.t.TLSExtensions.Clone()
+	if err != nil {
+		return err
+	}
+
+	if tlsExtensions.ClientHelloHexStream != "" {
+		if strings.Index(tlsExtensions.ClientHelloHexStream, "0029") == -1 {
 			tlscfg.SessionTicketsDisabled = true
 		}
 		tlsConn = tls.UClient(plainConn, tlscfg, tls.HelloCustom)
 
-		clientHelloHexStreamBytes := []byte(pconn.t.TLSExtensions.ClientHelloHexStream)
+		clientHelloHexStreamBytes := []byte(tlsExtensions.ClientHelloHexStream)
 		clientHelloBytes := make([]byte, hex.DecodedLen(len(clientHelloHexStreamBytes)))
 		_, err := hex.Decode(clientHelloBytes, clientHelloHexStreamBytes)
 		if err != nil {
@@ -1690,18 +1695,18 @@ func (pconn *persistConn) addTLS(ctx context.Context, name string, trace *httptr
 		tlsConn = tls.UClient(plainConn, tlscfg, tls.HelloCustom)
 
 		// KeyShare's Data was assigned after multiple requests were resolved
-		if pconn.t.TLSExtensions.KeyShareCurves != nil {
-			for i := range pconn.t.TLSExtensions.KeyShareCurves.KeyShares {
-				v := pconn.t.TLSExtensions.KeyShareCurves.KeyShares[i].Group
+		if tlsExtensions.KeyShareCurves != nil {
+			for i := range tlsExtensions.KeyShareCurves.KeyShares {
+				v := tlsExtensions.KeyShareCurves.KeyShares[i].Group
 				if ((v >> 8) == v&0xff) && v&0xf == 0xa {
-					pconn.t.TLSExtensions.KeyShareCurves.KeyShares[i].Data = []byte{0}
+					tlsExtensions.KeyShareCurves.KeyShares[i].Data = []byte{0}
 				} else {
-					pconn.t.TLSExtensions.KeyShareCurves.KeyShares[i].Data = nil
+					tlsExtensions.KeyShareCurves.KeyShares[i].Data = nil
 				}
 			}
 		}
 
-		spec, err := pconn.t.TLSExtensions.StringToSpec(pconn.t.JA3, pconn.t.UserAgent, pconn.t.ForceHTTP1, pconn.t.RandomJA3)
+		spec, err := tlsExtensions.StringToSpec(pconn.t.JA3, pconn.t.UserAgent, pconn.t.ForceHTTP1, pconn.t.RandomJA3)
 		if err != nil {
 			return err
 		}
