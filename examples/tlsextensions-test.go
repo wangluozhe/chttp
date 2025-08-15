@@ -429,6 +429,7 @@ func request(req *http.Request) {
 	t2.HTTP2Settings = h2ss
 	t1.H2Transport = t2
 	t1.JA3 = "771,4865-4866-4867-49195-49199-49196-49200-52393-52392-49171-49172-156-157-47-53,11-16-27-18-10-23-13-35-43-5-65037-0-17513-51-65281-45-41,4588-29-23-24,0"
+	t1.RandomJA3 = true
 	es := &Extensions{
 		SupportedSignatureAlgorithms: []string{
 			"ECDSAWithP256AndSHA256",

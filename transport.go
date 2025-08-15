@@ -298,6 +298,7 @@ type Transport struct {
 
 	// Custom TLS Extensions
 	JA3           string
+	RandomJA3     bool
 	UserAgent     string
 	TLSExtensions *TLSExtensions
 	ForceHTTP1    bool
@@ -1700,7 +1701,7 @@ func (pconn *persistConn) addTLS(ctx context.Context, name string, trace *httptr
 			}
 		}
 
-		spec, err := pconn.t.TLSExtensions.StringToSpec(pconn.t.JA3, pconn.t.UserAgent, pconn.t.ForceHTTP1)
+		spec, err := pconn.t.TLSExtensions.StringToSpec(pconn.t.JA3, pconn.t.UserAgent, pconn.t.ForceHTTP1, pconn.t.RandomJA3)
 		if err != nil {
 			return err
 		}

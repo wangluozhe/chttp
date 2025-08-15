@@ -56,7 +56,7 @@ func parseUserAgent(userAgent string) string {
 }
 
 // StringToSpec creates a ClientHelloSpec based on a JA3 string
-func (tlsExtensions *TLSExtensions) StringToSpec(ja3 string, userAgent string, forceHTTP1 bool) (*utls.ClientHelloSpec, error) {
+func (tlsExtensions *TLSExtensions) StringToSpec(ja3 string, userAgent string, forceHTTP1 bool, randomJA3 bool) (*utls.ClientHelloSpec, error) {
 	parsedUserAgent := parseUserAgent(userAgent)
 	if tlsExtensions == nil {
 		tlsExtensions = &TLSExtensions{}
@@ -195,6 +195,12 @@ func (tlsExtensions *TLSExtensions) StringToSpec(ja3 string, userAgent string, f
 		suites = append(suites, uint16(cid))
 	}
 	_ = vid
+
+	// random ja3 extensions
+	if randomJA3 {
+		exts = utls.ShuffleChromeTLSExtensions(exts)
+	}
+
 	return &utls.ClientHelloSpec{
 		// TLSVersMin:         vid,
 		// TLSVersMax:         vid,
