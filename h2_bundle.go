@@ -28,7 +28,6 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/rand"
-	tls "github.com/refraction-networking/utls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -39,7 +38,6 @@ import (
 	"math/bits"
 	mathrand "math/rand"
 	"net"
-	"github.com/wangluozhe/chttp/httptrace"
 	"net/textproto"
 	"net/url"
 	"os"
@@ -51,6 +49,10 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/fxamacker/cbor"
+	tls "github.com/refraction-networking/utls"
+	"github.com/wangluozhe/chttp/httptrace"
 
 	"golang.org/x/net/http/httpguts"
 	"golang.org/x/net/http2/hpack"
@@ -7204,6 +7206,19 @@ type HTTP2Settings struct {
 	PriorityFrames []HTTP2PriorityFrame
 }
 
+func (http2Settings *HTTP2Settings) Clone() (*HTTP2Settings, error) {
+	data, err := cbor.Marshal(http2Settings, cbor.EncOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	var clone *HTTP2Settings
+	if err := cbor.Unmarshal(data, &clone); err != nil {
+		return nil, err
+	}
+	return clone, nil
+}
+
 
 // Transport is an HTTP/2 Transport.
 //
@@ -8005,26 +8020,30 @@ func (t *HTTP2Transport) newClientConn(c net.Conn, singleUse bool) (*http2Client
 	//cc.inflow.init(http2transportDefaultConnFlow + http2initialWindowSize)
 
 	if t.HTTP2Settings != nil {
+		http2Settings, err := t.HTTP2Settings.Clone()
+		if err != nil {
+			return nil, err
+		}
 		inflowValue := http2transportDefaultStreamFlow
-		if t.HTTP2Settings.Settings != nil {
-			for _, setting := range t.HTTP2Settings.Settings {
+		if http2Settings.Settings != nil {
+			for _, setting := range http2Settings.Settings {
 				if setting.ID == HTTP2SettingInitialWindowSize {
 					inflowValue = int(setting.Val)
 				}
 			}
 		}
-		if len(t.HTTP2Settings.Settings) != 0 {
-			cc.fr.WriteSettings(t.HTTP2Settings.Settings...)
+		if len(http2Settings.Settings) != 0 {
+			cc.fr.WriteSettings(http2Settings.Settings...)
 		} else {
 			cc.fr.WriteSettings(initialSettings...)
 		}
 		var connectionFlow = http2transportDefaultConnFlow
-		if t.HTTP2Settings.ConnectionFlow != 0 {
-			connectionFlow = t.HTTP2Settings.ConnectionFlow
+		if http2Settings.ConnectionFlow != 0 {
+			connectionFlow = http2Settings.ConnectionFlow
 		}
 		cc.fr.WriteWindowUpdate(0, uint32(connectionFlow))
-		if t.HTTP2Settings.PriorityFrames != nil {
-			for _, frame := range t.HTTP2Settings.PriorityFrames {
+		if http2Settings.PriorityFrames != nil {
+			for _, frame := range http2Settings.PriorityFrames {
 				cc.fr.WritePriority(frame.StreamID, frame.HTTP2PriorityParam)
 				cc.nextStreamID = frame.StreamID + uint32(2)
 			}
@@ -8885,8 +8904,13 @@ func (cc *http2ClientConn) writeHeaders(streamID uint32, endStream bool, maxFram
 		endHeaders := len(hdrs) == 0
 		if first {
 			headersPriorityParam := HTTP2PriorityParam{}
+
 			if cc.t.HTTP2Settings != nil && cc.t.HTTP2Settings.HeaderPriority != nil {
-				headersPriorityParam = *cc.t.HTTP2Settings.HeaderPriority
+				http2Settings, err := cc.t.HTTP2Settings.Clone()
+				if err != nil {
+					return err
+				}
+				headersPriorityParam = *http2Settings.HeaderPriority
 			}
 			cc.fr.WriteHeaders(http2HeadersFrameParam{
 				StreamID:      streamID,

@@ -1,10 +1,11 @@
 package http
 
 import (
-	"crypto/sha256"
 	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/fxamacker/cbor"
 
 	utls "github.com/refraction-networking/utls"
 )
@@ -207,8 +208,21 @@ func (tlsExtensions *TLSExtensions) StringToSpec(ja3 string, userAgent string, f
 		CipherSuites:       suites,
 		CompressionMethods: []byte{0},
 		Extensions:         exts,
-		GetSessionID:       sha256.Sum256,
+		//GetSessionID:       sha256.Sum256,
 	}, nil
+}
+
+func (tlsExtensions *TLSExtensions) Clone() (*TLSExtensions, error) {
+	data, err := cbor.Marshal(tlsExtensions, cbor.EncOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	var clone *TLSExtensions
+	if err := cbor.Unmarshal(data, &clone); err != nil {
+		return nil, err
+	}
+	return clone, nil
 }
 
 func genMap() (extMap map[string]utls.TLSExtension) {
@@ -303,7 +317,7 @@ func genMap() (extMap map[string]utls.TLSExtension) {
 		"65281": &utls.RenegotiationInfoExtension{
 			Renegotiation: utls.RenegotiateOnceAsClient,
 		},
-		"65037": &utls.GREASEEncryptedClientHelloExtension{},
+		"65037": utls.BoringGREASEECH(),
 	}
 	return
 }
