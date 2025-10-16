@@ -4,7 +4,7 @@ go 1.24.0
 
 require (
 	github.com/fxamacker/cbor v1.5.1
-	github.com/refraction-networking/utls v1.8.0
+	github.com/refraction-networking/utls v1.8.1
 	golang.org/x/net v0.38.0
 )
 
