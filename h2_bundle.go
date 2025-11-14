@@ -7202,6 +7202,7 @@ const (
 type HTTP2Settings struct {
 	Settings       []HTTP2Setting
 	ConnectionFlow int
+	HeadersID      int
 	HeaderPriority *HTTP2PriorityParam
 	PriorityFrames []HTTP2PriorityFrame
 }
@@ -8483,6 +8484,7 @@ func (cc *http2ClientConn) RoundTrip(req *Request) (*Response, error) {
 
 func (cc *http2ClientConn) roundTrip(req *Request, streamf func(*http2clientStream)) (*Response, error) {
 	ctx := req.Context()
+	cc.nextStreamID = uint32(cc.t.HTTP2Settings.HeadersID)
 	cs := &http2clientStream{
 		cc:                   cc,
 		ctx:                  ctx,
