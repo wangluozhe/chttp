@@ -7203,6 +7203,7 @@ type HTTP2Settings struct {
 	Settings       []HTTP2Setting
 	ConnectionFlow int
 	HeadersID      int
+	HeadersAck     bool
 	HeaderPriority *HTTP2PriorityParam
 	PriorityFrames []HTTP2PriorityFrame
 }
@@ -8043,6 +8044,9 @@ func (t *HTTP2Transport) newClientConn(c net.Conn, singleUse bool) (*http2Client
 			connectionFlow = http2Settings.ConnectionFlow
 		}
 		cc.fr.WriteWindowUpdate(0, uint32(connectionFlow))
+		if http2Settings.HeadersAck {
+			cc.fr.WriteSettingsAck()
+		}
 		if http2Settings.PriorityFrames != nil {
 			for _, frame := range http2Settings.PriorityFrames {
 				cc.fr.WritePriority(frame.StreamID, frame.HTTP2PriorityParam)
