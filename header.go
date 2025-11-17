@@ -5,14 +5,15 @@
 package http
 
 import (
-	"github.com/wangluozhe/chttp/httptrace"
-	"github.com/wangluozhe/chttp/internal/ascii"
 	"io"
 	"net/textproto"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/wangluozhe/chttp/httptrace"
+	"github.com/wangluozhe/chttp/internal/ascii"
 
 	"golang.org/x/net/http/httpguts"
 )
@@ -72,7 +73,11 @@ func (h Header) ContainsUnChangedHeaderKeys(target string) bool {
 // The key is case insensitive; it is canonicalized by
 // [CanonicalHeaderKey].
 func (h Header) Add(key, value string) {
-	textproto.MIMEHeader(h).Add(key, value)
+	if h.ContainsUnChangedHeaderKeys(key) {
+		h[key] = append(h[key], value)
+	} else {
+		textproto.MIMEHeader(h).Add(key, value)
+	}
 }
 
 // Set sets the header entries associated with key to the
@@ -81,7 +86,11 @@ func (h Header) Add(key, value string) {
 // canonicalized by [textproto.CanonicalMIMEHeaderKey].
 // To use non-canonical keys, assign to the map directly.
 func (h Header) Set(key, value string) {
-	textproto.MIMEHeader(h).Set(key, value)
+	if h.ContainsUnChangedHeaderKeys(key) {
+		h[key] = []string{value}
+	} else {
+		textproto.MIMEHeader(h).Set(key, value)
+	}
 }
 
 // Get gets the first value associated with the given key. If
@@ -91,7 +100,18 @@ func (h Header) Set(key, value string) {
 // keys are stored in canonical form. To use non-canonical keys,
 // access the map directly.
 func (h Header) Get(key string) string {
-	return textproto.MIMEHeader(h).Get(key)
+	if h.ContainsUnChangedHeaderKeys(key) {
+		if h == nil {
+			return ""
+		}
+		v := h[key]
+		if len(v) == 0 {
+			return ""
+		}
+		return v[0]
+	} else {
+		return textproto.MIMEHeader(h).Get(key)
+	}
 }
 
 // Values returns all values associated with the given key.
@@ -100,7 +120,14 @@ func (h Header) Get(key string) string {
 // keys, access the map directly.
 // The returned slice is not a copy.
 func (h Header) Values(key string) []string {
-	return textproto.MIMEHeader(h).Values(key)
+	if h.ContainsUnChangedHeaderKeys(key) {
+		if h == nil {
+			return nil
+		}
+		return h[key]
+	} else {
+		return textproto.MIMEHeader(h).Values(key)
+	}
 }
 
 // get is like Get, but key must already be in CanonicalHeaderKey form.
@@ -122,7 +149,11 @@ func (h Header) has(key string) bool {
 // The key is case insensitive; it is canonicalized by
 // [CanonicalHeaderKey].
 func (h Header) Del(key string) {
-	textproto.MIMEHeader(h).Del(key)
+	if h.ContainsUnChangedHeaderKeys(key) {
+		delete(h, key)
+	} else {
+		textproto.MIMEHeader(h).Del(key)
+	}
 }
 
 // Write writes a header in wire format.

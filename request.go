@@ -13,9 +13,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	tls "github.com/refraction-networking/utls"
-	"github.com/wangluozhe/chttp/httptrace"
-	"github.com/wangluozhe/chttp/internal/ascii"
 	"io"
 	"mime"
 	"mime/multipart"
@@ -26,6 +23,10 @@ import (
 	"strings"
 	"sync"
 	_ "unsafe" // for linkname
+
+	tls "github.com/refraction-networking/utls"
+	"github.com/wangluozhe/chttp/httptrace"
+	"github.com/wangluozhe/chttp/internal/ascii"
 
 	"golang.org/x/net/http/httpguts"
 	"golang.org/x/net/idna"
@@ -734,6 +735,14 @@ func (r *Request) write(w io.Writer, usingProxy bool, extraHeaders Header, waitF
 	err = tw.writeHeader(w, trace)
 	if err != nil {
 		return err
+	}
+	// Write Content-Length and/or Transfer-Encoding whose values are a
+	// function of the sanitized field triple (Body, ContentLength,
+	// TransferEncoding)
+	if tw.shouldSendContentLength() {
+		r.Header.Set("Content-Length", strconv.FormatInt(tw.ContentLength, 10))
+	} else if chunked(tw.TransferEncoding) {
+		r.Header.Set("Transfer-Encoding", "chunked")
 	}
 
 	err = r.Header.writeSubset(w, reqWriteExcludeHeader, trace)

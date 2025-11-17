@@ -9,10 +9,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"github.com/wangluozhe/chttp/httptrace"
-	"github.com/wangluozhe/chttp/internal"
-	"github.com/wangluozhe/chttp/internal/ascii"
-	"github.com/wangluozhe/chttp/internal/godebug"
 	"io"
 	"net/textproto"
 	"reflect"
@@ -21,6 +17,11 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/wangluozhe/chttp/httptrace"
+	"github.com/wangluozhe/chttp/internal"
+	"github.com/wangluozhe/chttp/internal/ascii"
+	"github.com/wangluozhe/chttp/internal/godebug"
 
 	"golang.org/x/net/http/httpguts"
 )
@@ -287,24 +288,24 @@ func (t *transferWriter) writeHeader(w io.Writer, trace *httptrace.ClientTrace) 
 	// Write Content-Length and/or Transfer-Encoding whose values are a
 	// function of the sanitized field triple (Body, ContentLength,
 	// TransferEncoding)
-	if t.shouldSendContentLength() {
-		if _, err := io.WriteString(w, "Content-Length: "); err != nil {
-			return err
-		}
-		if _, err := io.WriteString(w, strconv.FormatInt(t.ContentLength, 10)+"\r\n"); err != nil {
-			return err
-		}
-		if trace != nil && trace.WroteHeaderField != nil {
-			trace.WroteHeaderField("Content-Length", []string{strconv.FormatInt(t.ContentLength, 10)})
-		}
-	} else if chunked(t.TransferEncoding) {
-		if _, err := io.WriteString(w, "Transfer-Encoding: chunked\r\n"); err != nil {
-			return err
-		}
-		if trace != nil && trace.WroteHeaderField != nil {
-			trace.WroteHeaderField("Transfer-Encoding", []string{"chunked"})
-		}
-	}
+	//if t.shouldSendContentLength() {
+	//	if _, err := io.WriteString(w, "Content-Length: "); err != nil {
+	//		return err
+	//	}
+	//	if _, err := io.WriteString(w, strconv.FormatInt(t.ContentLength, 10)+"\r\n"); err != nil {
+	//		return err
+	//	}
+	//	if trace != nil && trace.WroteHeaderField != nil {
+	//		trace.WroteHeaderField("Content-Length", []string{strconv.FormatInt(t.ContentLength, 10)})
+	//	}
+	//} else if chunked(t.TransferEncoding) {
+	//	if _, err := io.WriteString(w, "Transfer-Encoding: chunked\r\n"); err != nil {
+	//		return err
+	//	}
+	//	if trace != nil && trace.WroteHeaderField != nil {
+	//		trace.WroteHeaderField("Transfer-Encoding", []string{"chunked"})
+	//	}
+	//}
 
 	// Write Trailer header
 	if t.Trailer != nil {
