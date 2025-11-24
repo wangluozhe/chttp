@@ -8488,8 +8488,10 @@ func (cc *http2ClientConn) RoundTrip(req *Request) (*Response, error) {
 
 func (cc *http2ClientConn) roundTrip(req *Request, streamf func(*http2clientStream)) (*Response, error) {
 	ctx := req.Context()
-	if cc.nextStreamID < uint32(cc.t.HTTP2Settings.HeadersID) {
-		cc.nextStreamID = uint32(cc.t.HTTP2Settings.HeadersID)
+	if cc.t.HTTP2Settings != nil {
+		if cc.nextStreamID < uint32(cc.t.HTTP2Settings.HeadersID) {
+			cc.nextStreamID = uint32(cc.t.HTTP2Settings.HeadersID)
+		}
 	}
 	cs := &http2clientStream{
 		cc:                   cc,
