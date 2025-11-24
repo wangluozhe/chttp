@@ -1780,9 +1780,39 @@ func (t *Transport) dialConn(ctx context.Context, cm connectMethod) (pconn *pers
 		}
 		return err
 	}
+	// 由于 net.Dialer 无法回调 chttp 的 httptrace，我们需要手动解析一次域名来触发钩子。
+	if trace != nil && (trace.DNSStart != nil || trace.DNSDone != nil) {
+		// 从地址中分离出主机名（去掉端口）
+		host, _, splitErr := net.SplitHostPort(cm.addr())
+		// 如果是域名而不是 IP，则进行 DNS 解析追踪
+		if splitErr == nil && net.ParseIP(host) == nil {
+			if trace.DNSStart != nil {
+				trace.DNSStart(httptrace.DNSStartInfo{Host: host})
+			}
+
+			// 使用标准库解析器进行解析
+			ips, dnsErr := net.DefaultResolver.LookupIPAddr(ctx, host)
+
+			if trace.DNSDone != nil {
+				trace.DNSDone(httptrace.DNSDoneInfo{
+					Addrs:     ips,
+					Err:       dnsErr,
+					Coalesced: false,
+				})
+			}
+			// 注意：我们这里忽略 ips 结果，让后续的 t.dial 再次解析并建立连接，
+			// 以保留底层 net.Dialer 的 Happy Eyeballs (IPv4/v6 优选) 等机制。
+		}
+	}
+	if trace != nil && trace.ConnectStart != nil {
+		trace.ConnectStart("tcp", cm.addr())
+	}
 	if cm.scheme() == "https" && t.hasCustomTLSDialer() {
 		var err error
 		pconn.conn, err = t.customDialTLS(ctx, "tcp", cm.addr())
+		if trace != nil && trace.ConnectDone != nil {
+			trace.ConnectDone("tcp", cm.addr(), err)
+		}
 		if err != nil {
 			return nil, wrapErr(err)
 		}
@@ -1807,6 +1837,9 @@ func (t *Transport) dialConn(ctx context.Context, cm connectMethod) (pconn *pers
 		}
 	} else {
 		conn, err := t.dial(ctx, "tcp", cm.addr())
+		if trace != nil && trace.ConnectDone != nil {
+			trace.ConnectDone("tcp", cm.addr(), err)
+		}
 		if err != nil {
 			return nil, wrapErr(err)
 		}
