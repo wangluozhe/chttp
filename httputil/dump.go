@@ -9,12 +9,14 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"github.com/wangluozhe/chttp"
 	"io"
 	"net"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
+
+	"github.com/wangluozhe/chttp"
 )
 
 // drainBody reads all of b to memory and then returns two equivalent
@@ -71,10 +73,165 @@ func outgoingLength(req *http.Request) int64 {
 	return -1
 }
 
+// dumpRequestH2 formats the request in a HTTP/2 style (pseudo-headers).
+func dumpRequestH2(req *http.Request, body bool) ([]byte, error) {
+	var b bytes.Buffer
+	var err error
+	save := req.Body
+
+	if !body || req.Body == nil {
+		req.Body = nil
+	} else {
+		save, req.Body, err = drainBody(req.Body)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// 1. Pseudo Headers Logic
+	// Default values
+	scheme := "https"
+	if req.URL != nil && req.URL.Scheme != "" {
+		scheme = req.URL.Scheme
+	}
+	authority := req.Host
+	if authority == "" && req.URL != nil {
+		authority = req.URL.Host
+	}
+	path := "/"
+	if req.URL != nil {
+		path = req.URL.RequestURI()
+	}
+
+	pseudos := map[string]string{
+		":method":    valueOrDefault(req.Method, "GET"),
+		":scheme":    scheme,
+		":authority": authority,
+		":path":      path,
+	}
+
+	// Determine Pseudo Header Order
+	// Default order
+	pOrder := []string{":method", ":scheme", ":authority", ":path"}
+	// Check PHeaderOrderKey
+	if v, ok := req.Header[http.PHeaderOrderKey]; ok && len(v) > 0 {
+		pOrder = v
+	}
+
+	for _, k := range pOrder {
+		if val, ok := pseudos[k]; ok && val != "" {
+			fmt.Fprintf(&b, "%s: %s\r\n", k, val)
+		}
+	}
+
+	// 2. Normal Headers Logic
+	var keys []string
+	// Collect keys excluding excluded ones and magic keys
+	for k := range req.Header {
+		if reqWriteExcludeHeaderDump[k] {
+			continue
+		}
+		if k == http.HeaderOrderKey || k == http.PHeaderOrderKey || k == http.UnChangedHeaderKey {
+			continue
+		}
+		keys = append(keys, k)
+	}
+
+	// Sort Keys
+	// Check HeaderOrderKey
+	if order, ok := req.Header[http.HeaderOrderKey]; ok && len(order) > 0 {
+		var orderedKeys []string
+		var otherKeys []string
+		orderMap := make(map[string]bool)
+		for _, k := range order {
+			orderMap[http.CanonicalHeaderKey(k)] = true
+		}
+
+		// First, add keys present in the order list
+		for _, k := range order {
+			// We iterate the 'order' list to preserve its sequence.
+			// However, we must ensure the key actually exists in the request headers.
+			// Since we only have canonical keys in 'keys', we need to match carefully.
+			canonicalK := http.CanonicalHeaderKey(k)
+			for _, existingK := range keys {
+				// 修改点1：使用 CanonicalHeaderKey 进行比较，兼容 "cookie" 和 "Cookie"
+				if http.CanonicalHeaderKey(existingK) == canonicalK {
+					orderedKeys = append(orderedKeys, existingK)
+					break
+				}
+			}
+		}
+
+		// Then find remaining keys
+		for _, k := range keys {
+			// 修改点2：检查 map 时也要使用 CanonicalHeaderKey
+			if !orderMap[http.CanonicalHeaderKey(k)] {
+				otherKeys = append(otherKeys, k)
+			}
+		}
+		sort.Strings(otherKeys)
+		keys = append(orderedKeys, otherKeys...)
+	} else {
+		sort.Strings(keys)
+	}
+
+	// Prepare UnChanged Header Map
+	unchangedMap := make(map[string]string)
+	if unchanged, ok := req.Header[http.UnChangedHeaderKey]; ok {
+		for _, v := range unchanged {
+			unchangedMap[http.CanonicalHeaderKey(v)] = v
+		}
+	}
+
+	for _, k := range keys {
+		vals := req.Header[k]
+		// Determine display key (Lowercase by default for H2, unless UnChangedHeaderKey overrides)
+		displayKey := strings.ToLower(k)
+		// 修改点3：查找 UnChanged map 时使用 CanonicalHeaderKey
+		if orig, ok := unchangedMap[http.CanonicalHeaderKey(k)]; ok {
+			displayKey = orig
+		}
+
+		for _, v := range vals {
+			// Special handling for Cookie splitting in H2
+			if strings.EqualFold(displayKey, "cookie") {
+				// Split by semicolon and trim spaces to simulate multiple cookie headers
+				cookies := strings.Split(v, ";")
+				for _, c := range cookies {
+					c = strings.TrimSpace(c)
+					if c != "" {
+						fmt.Fprintf(&b, "%s: %s\r\n", displayKey, c)
+					}
+				}
+			} else {
+				fmt.Fprintf(&b, "%s: %s\r\n", displayKey, v)
+			}
+		}
+	}
+
+	io.WriteString(&b, "\r\n")
+
+	// 3. Body
+	if req.Body != nil {
+		_, err = io.Copy(&b, req.Body)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	req.Body = save
+	return b.Bytes(), nil
+}
+
 // DumpRequestOut is like [DumpRequest] but for outgoing client requests. It
 // includes any headers that the standard [http.Transport] adds, such as
 // User-Agent.
 func DumpRequestOut(req *http.Request, body bool) ([]byte, error) {
+	// 如果是 HTTP/2，直接使用 H2 格式化逻辑，不走 Transport 模拟
+	if req.ProtoMajor == 2 {
+		return dumpRequestH2(req, body)
+	}
+
 	save := req.Body
 	dummyBody := false
 	if !body {
@@ -216,6 +373,11 @@ var reqWriteExcludeHeaderDump = map[string]bool{
 // The documentation for [http.Request.Write] details which fields
 // of req are included in the dump.
 func DumpRequest(req *http.Request, body bool) ([]byte, error) {
+	// 如果是 HTTP/2，切换到 H2 格式输出
+	if req.ProtoMajor == 2 {
+		return dumpRequestH2(req, body)
+	}
+
 	var err error
 	save := req.Body
 	if !body || req.Body == nil {
@@ -301,8 +463,136 @@ func (failureToReadBody) Close() error             { return nil }
 // emptyBody is an instance of empty reader.
 var emptyBody = io.NopCloser(strings.NewReader(""))
 
+// dumpResponseH2 formats the response in a HTTP/2 style.
+func dumpResponseH2(resp *http.Response, body bool) ([]byte, error) {
+	var b bytes.Buffer
+	var err error
+	save := resp.Body
+
+	if !body {
+		resp.Body = emptyBody // Not strictly needed here but keeps logic similar
+	} else if resp.Body == nil {
+		resp.Body = emptyBody
+	} else {
+		save, resp.Body, err = drainBody(resp.Body)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// 1. Pseudo Headers Logic
+	// :status is the only response pseudo header
+	pseudos := map[string]string{
+		":status": fmt.Sprintf("%d", resp.StatusCode),
+	}
+	pOrder := []string{":status"}
+
+	// Check PHeaderOrderKey
+	if v, ok := resp.Header[http.PHeaderOrderKey]; ok && len(v) > 0 {
+		pOrder = v
+	}
+
+	for _, k := range pOrder {
+		if val, ok := pseudos[k]; ok {
+			fmt.Fprintf(&b, "%s: %s\r\n", k, val)
+		}
+	}
+
+	// 2. Normal Headers Logic
+	var keys []string
+	for k := range resp.Header {
+		if k == http.HeaderOrderKey || k == http.PHeaderOrderKey || k == http.UnChangedHeaderKey {
+			continue
+		}
+		keys = append(keys, k)
+	}
+
+	// Sort Keys
+	// Check HeaderOrderKey
+	if order, ok := resp.Header[http.HeaderOrderKey]; ok && len(order) > 0 {
+		var orderedKeys []string
+		var otherKeys []string
+		orderMap := make(map[string]bool)
+		for _, k := range order {
+			orderMap[http.CanonicalHeaderKey(k)] = true
+		}
+
+		for _, k := range order {
+			canonicalK := http.CanonicalHeaderKey(k)
+			for _, existingK := range keys {
+				// 修改点1：使用 CanonicalHeaderKey 进行比较
+				if http.CanonicalHeaderKey(existingK) == canonicalK {
+					orderedKeys = append(orderedKeys, existingK)
+					break
+				}
+			}
+		}
+
+		for _, k := range keys {
+			// 修改点2：检查 map 时使用 CanonicalHeaderKey
+			if !orderMap[http.CanonicalHeaderKey(k)] {
+				otherKeys = append(otherKeys, k)
+			}
+		}
+		sort.Strings(otherKeys)
+		keys = append(orderedKeys, otherKeys...)
+	} else {
+		sort.Strings(keys)
+	}
+
+	// Prepare UnChanged Header Map
+	unchangedMap := make(map[string]string)
+	if unchanged, ok := resp.Header[http.UnChangedHeaderKey]; ok {
+		for _, v := range unchanged {
+			unchangedMap[http.CanonicalHeaderKey(v)] = v
+		}
+	}
+
+	for _, k := range keys {
+		vals := resp.Header[k]
+		displayKey := strings.ToLower(k)
+		// 修改点3：查找 UnChanged map 时使用 CanonicalHeaderKey
+		if orig, ok := unchangedMap[http.CanonicalHeaderKey(k)]; ok {
+			displayKey = orig
+		}
+		for _, v := range vals {
+			// Response typically uses Set-Cookie, which is naturally multiple lines in http.Header
+			// But if regular Cookie appears (weird in response), we treat it same way
+			if strings.EqualFold(displayKey, "cookie") {
+				cookies := strings.Split(v, ";")
+				for _, c := range cookies {
+					c = strings.TrimSpace(c)
+					if c != "" {
+						fmt.Fprintf(&b, "%s: %s\r\n", displayKey, c)
+					}
+				}
+			} else {
+				fmt.Fprintf(&b, "%s: %s\r\n", displayKey, v)
+			}
+		}
+	}
+
+	io.WriteString(&b, "\r\n")
+
+	// 3. Body
+	if body && resp.Body != nil {
+		_, err = io.Copy(&b, resp.Body)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	resp.Body = save
+	return b.Bytes(), nil
+}
+
 // DumpResponse is like DumpRequest but dumps a response.
 func DumpResponse(resp *http.Response, body bool) ([]byte, error) {
+	// 如果是 HTTP/2，切换到 H2 格式输出
+	if resp.ProtoMajor == 2 {
+		return dumpResponseH2(resp, body)
+	}
+
 	var b bytes.Buffer
 	var err error
 	save := resp.Body
