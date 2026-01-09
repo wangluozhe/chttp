@@ -9334,19 +9334,19 @@ func (cc *http2ClientConn) encodeHeaders(req *Request, addGzipHeader bool, trail
 				// Cookie header field MAY be split into separate header fields,
 				// each with one or more cookie-pairs.
 				for _, v := range kv.values {
-					//for {
-					//	p := strings.IndexByte(v, ';')
-					//	if p < 0 {
-					//		break
-					//	}
-					//	f("cookie", v[:p])
-					//	p++
-					//	// strip space after semicolon if any.
-					//	for p+1 <= len(v) && v[p] == ' ' {
-					//		p++
-					//	}
-					//	v = v[p:]
-					//}
+					for {
+						p := strings.IndexByte(v, ';')
+						if p < 0 {
+							break
+						}
+						f("cookie", v[:p])
+						p++
+						// strip space after semicolon if any.
+						for p+1 <= len(v) && v[p] == ' ' {
+							p++
+						}
+						v = v[p:]
+					}
 					if len(v) > 0 {
 						f("cookie", v)
 					}
