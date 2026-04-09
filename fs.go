@@ -9,6 +9,7 @@ package http
 import (
 	"errors"
 	"fmt"
+	"github.com/wangluozhe/chttp/internal"
 	"github.com/wangluozhe/chttp/internal/godebug"
 	"io"
 	"io/fs"
@@ -67,6 +68,11 @@ func mapOpenError(originalErr error, name string, sep rune, stat func(string) (f
 	return originalErr
 }
 
+// errInvalidUnsafePath is returned by Dir.Open when the call to
+// filepath.Localize fails. filepath.Localize returns an error if the path
+// cannot be represented by the operating system.
+var errInvalidUnsafePath = errors.New("http: invalid or unsafe file path")
+
 // Open implements [FileSystem] using [os.Open], opening files for reading rooted
 // and relative to the directory d.
 func (d Dir) Open(name string) (File, error) {
@@ -76,7 +82,7 @@ func (d Dir) Open(name string) (File, error) {
 	}
 	path, err := filepath.Localize(path)
 	if err != nil {
-		return nil, errors.New("http: invalid or unsafe file path")
+		return nil, errInvalidUnsafePath
 	}
 	dir := string(d)
 	if dir == "" {
@@ -283,7 +289,7 @@ func serveContent(w ResponseWriter, r *Request, name string, modtime time.Time, 
 		ctype = mime.TypeByExtension(filepath.Ext(name))
 		if ctype == "" {
 			// read a chunk to decide between utf-8 text and binary
-			var buf [sniffLen]byte
+			var buf [internal.SniffLen]byte
 			n, _ := io.ReadFull(content, buf[:])
 			ctype = DetectContentType(buf[:n])
 			_, err := content.Seek(0, io.SeekStart) // rewind to output whole file
@@ -768,6 +774,9 @@ func toHTTPError(err error) (msg string, httpStatus int) {
 	if errors.Is(err, fs.ErrPermission) {
 		return "403 Forbidden", StatusForbidden
 	}
+	if errors.Is(err, errInvalidUnsafePath) {
+		return "404 page not found", StatusNotFound
+	}
 	// Default:
 	return "500 Internal Server Error", StatusInternalServerError
 }
@@ -854,7 +863,7 @@ func containsDotDot(v string) bool {
 	if !strings.Contains(v, "..") {
 		return false
 	}
-	for _, ent := range strings.FieldsFunc(v, isSlashRune) {
+	for ent := range strings.FieldsFuncSeq(v, isSlashRune) {
 		if ent == ".." {
 			return true
 		}
@@ -1014,7 +1023,7 @@ func parseRange(s string, size int64) ([]httpRange, error) {
 	}
 	var ranges []httpRange
 	noOverlap := false
-	for _, ra := range strings.Split(s[len(b):], ",") {
+	for ra := range strings.SplitSeq(s[len(b):], ",") {
 		ra = textproto.TrimString(ra)
 		if ra == "" {
 			continue

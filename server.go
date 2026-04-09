@@ -12,12 +12,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	tls "github.com/refraction-networking/utls"
-	"github.com/wangluozhe/chttp/internal/godebug"
 	"io"
 	"log"
 	"maps"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"net/textproto"
 	"net/url"
@@ -32,6 +30,10 @@ import (
 	"time"
 	_ "unsafe" // for linkname
 
+	tls "github.com/refraction-networking/utls"
+	"github.com/wangluozhe/chttp/internal"
+	"github.com/wangluozhe/chttp/internal/godebug"
+
 	"golang.org/x/net/http/httpguts"
 )
 
@@ -40,7 +42,7 @@ var (
 	// ErrBodyNotAllowed is returned by ResponseWriter.Write calls
 	// when the HTTP method or response code does not permit a
 	// body.
-	ErrBodyNotAllowed = errors.New("http: request method or response status code does not allow body")
+	ErrBodyNotAllowed = internal.ErrBodyNotAllowed
 
 	// ErrHijacked is returned by ResponseWriter.Write calls when
 	// the underlying connection has been hijacked using the
@@ -56,7 +58,7 @@ var (
 	ErrContentLength = errors.New("http: wrote more than the declared Content-Length")
 
 	// Deprecated: ErrWriteAfterFlush is no longer returned by
-	// anything in the github.com/wangluozhe/chttp package. Callers should not
+	// anything in the net/http package. Callers should not
 	// compare errors against this variable.
 	ErrWriteAfterFlush = errors.New("unused")
 )
@@ -261,7 +263,7 @@ type conn struct {
 
 	// rwc is the underlying network connection.
 	// This is never wrapped by other types and is the value given out
-	// to CloseNotifier callers. It is usually of type *net.TCPConn or
+	// to [Hijacker] callers. It is usually of type *net.TCPConn or
 	// *tls.Conn.
 	rwc net.Conn
 
@@ -324,12 +326,14 @@ func (c *conn) hijackLocked() (rwc net.Conn, buf *bufio.ReadWriter, err error) {
 	rwc = c.rwc
 	rwc.SetDeadline(time.Time{})
 
-	buf = bufio.NewReadWriter(c.bufr, bufio.NewWriter(rwc))
 	if c.r.hasByte {
 		if _, err := c.bufr.Peek(c.bufr.Buffered() + 1); err != nil {
 			return nil, nil, fmt.Errorf("unexpected Peek failure reading buffered byte: %v", err)
 		}
 	}
+	c.bufw.Reset(rwc)
+	buf = bufio.NewReadWriter(c.bufr, c.bufw)
+
 	c.setState(rwc, StateHijacked, runHooks)
 	return
 }
@@ -486,11 +490,12 @@ type response struct {
 	clenBuf   [10]byte
 	statusBuf [3]byte
 
+	// lazyCloseNotifyMu protects closeNotifyCh and closeNotifyTriggered.
+	lazyCloseNotifyMu sync.Mutex
 	// closeNotifyCh is the channel returned by CloseNotify.
-	// TODO(bradfitz): this is currently (for Go 1.8) always
-	// non-nil. Make this lazily-created again as it used to be?
-	closeNotifyCh  chan bool
-	didCloseNotify atomic.Bool // atomic (only false->true winner should send)
+	closeNotifyCh chan bool
+	// closeNotifyTriggered tracks prior closeNotify calls.
+	closeNotifyTriggered bool
 }
 
 func (c *response) SetReadDeadline(deadline time.Time) error {
@@ -600,9 +605,9 @@ func (w *response) ReadFrom(src io.Reader) (n int64, err error) {
 	// source is available (see golang.org/issue/5660) and provides
 	// enough bytes to perform Content-Type sniffing when required.
 	if !w.cw.wroteHeader {
-		n0, err := io.CopyBuffer(writerOnly{w}, io.LimitReader(src, sniffLen), buf)
+		n0, err := io.CopyBuffer(writerOnly{w}, io.LimitReader(src, internal.SniffLen), buf)
 		n += n0
-		if err != nil || n0 < sniffLen {
+		if err != nil || n0 < internal.SniffLen {
 			return n, err
 		}
 	}
@@ -611,7 +616,31 @@ func (w *response) ReadFrom(src io.Reader) (n int64, err error) {
 	w.cw.flush() // make sure Header is written; flush data to rwc
 
 	// Now that cw has been flushed, its chunking field is guaranteed initialized.
-	if !w.cw.chunking && w.bodyAllowed() {
+	if !w.cw.chunking && w.bodyAllowed() && w.req.Method != "HEAD" {
+		// When a content length is declared, but exceeded; any excess bytes
+		// from src should be ignored, and ErrContentLength should be returned.
+		// This mirrors the behavior of response.Write.
+		if w.contentLength != -1 {
+			defer func(originalReader io.Reader) {
+				if w.written != w.contentLength {
+					return
+				}
+				if n, _ := originalReader.Read([]byte{0}); err == nil && n != 0 {
+					err = ErrContentLength
+				}
+			}(src)
+			// src can be an io.LimitedReader already. To avoid unnecessary
+			// alloc and having to unnest readers repeatedly in net.sendFile,
+			// just adjust the existing LimitedReader N when this is the case.
+			if lr, ok := src.(*io.LimitedReader); ok {
+				if lenDiff := lr.N - (w.contentLength - w.written); lenDiff > 0 {
+					defer func() { lr.N += lenDiff }()
+					lr.N -= lenDiff
+				}
+			} else {
+				src = io.LimitReader(src, w.contentLength-w.written)
+			}
+		}
 		n0, err := rf.ReadFrom(src)
 		n += n0
 		w.written += n0
@@ -628,9 +657,9 @@ func (w *response) ReadFrom(src io.Reader) (n int64, err error) {
 const debugServerConnections = false
 
 // Create new connection from rwc.
-func (srv *Server) newConn(rwc net.Conn) *conn {
+func (s *Server) newConn(rwc net.Conn) *conn {
 	c := &conn{
-		server: srv,
+		server: s,
 		rwc:    rwc,
 	}
 	if debugServerConnections {
@@ -651,10 +680,13 @@ type readResult struct {
 // read sizes) with support for selectively keeping an io.Reader.Read
 // call blocked in a background goroutine to wait for activity and
 // trigger a CloseNotifier channel.
+// After a Handler has hijacked the conn and exited, connReader behaves like a
+// proxy for the net.Conn and the aforementioned behavior is bypassed.
 type connReader struct {
-	conn *conn
+	rwc net.Conn // rwc is the underlying network connection.
 
 	mu      sync.Mutex // guards following
+	conn    *conn      // conn is nil after handler exit.
 	hasByte bool
 	byteBuf [1]byte
 	cond    *sync.Cond
@@ -672,6 +704,12 @@ func (cr *connReader) lock() {
 
 func (cr *connReader) unlock() { cr.mu.Unlock() }
 
+func (cr *connReader) releaseConn() {
+	cr.lock()
+	defer cr.unlock()
+	cr.conn = nil
+}
+
 func (cr *connReader) startBackgroundRead() {
 	cr.lock()
 	defer cr.unlock()
@@ -682,12 +720,12 @@ func (cr *connReader) startBackgroundRead() {
 		return
 	}
 	cr.inRead = true
-	cr.conn.rwc.SetReadDeadline(time.Time{})
+	cr.rwc.SetReadDeadline(time.Time{})
 	go cr.backgroundRead()
 }
 
 func (cr *connReader) backgroundRead() {
-	n, err := cr.conn.rwc.Read(cr.byteBuf[:])
+	n, err := cr.rwc.Read(cr.byteBuf[:])
 	cr.lock()
 	if n == 1 {
 		cr.hasByte = true
@@ -718,7 +756,7 @@ func (cr *connReader) backgroundRead() {
 		// Ignore this error. It's the expected error from
 		// another goroutine calling abortPendingRead.
 	} else if err != nil {
-		cr.handleReadError(err)
+		cr.handleReadErrorLocked(err)
 	}
 	cr.aborted = false
 	cr.inRead = false
@@ -733,18 +771,18 @@ func (cr *connReader) abortPendingRead() {
 		return
 	}
 	cr.aborted = true
-	cr.conn.rwc.SetReadDeadline(aLongTimeAgo)
+	cr.rwc.SetReadDeadline(aLongTimeAgo)
 	for cr.inRead {
 		cr.cond.Wait()
 	}
-	cr.conn.rwc.SetReadDeadline(time.Time{})
+	cr.rwc.SetReadDeadline(time.Time{})
 }
 
 func (cr *connReader) setReadLimit(remain int64) { cr.remain = remain }
 func (cr *connReader) setInfiniteReadLimit()     { cr.remain = maxInt64 }
 func (cr *connReader) hitReadLimit() bool        { return cr.remain <= 0 }
 
-// handleReadError is called whenever a Read from the client returns a
+// handleReadErrorLocked is called whenever a Read from the client returns a
 // non-nil error.
 //
 // The provided non-nil err is almost always io.EOF or a "use of
@@ -753,25 +791,27 @@ func (cr *connReader) hitReadLimit() bool        { return cr.remain <= 0 }
 // development. Any error means the connection is dead and we should
 // down its context.
 //
-// It may be called from multiple goroutines.
-func (cr *connReader) handleReadError(_ error) {
+// The caller must hold connReader.mu.
+func (cr *connReader) handleReadErrorLocked(_ error) {
+	if cr.conn == nil {
+		return
+	}
 	cr.conn.cancelCtx()
-	cr.closeNotify()
-}
-
-// may be called from multiple goroutines.
-func (cr *connReader) closeNotify() {
-	res := cr.conn.curReq.Load()
-	if res != nil && !res.didCloseNotify.Swap(true) {
-		res.closeNotifyCh <- true
+	if res := cr.conn.curReq.Load(); res != nil {
+		res.closeNotify()
 	}
 }
 
 func (cr *connReader) Read(p []byte) (n int, err error) {
 	cr.lock()
-	if cr.inRead {
+	if cr.conn == nil {
 		cr.unlock()
-		if cr.conn.hijacked() {
+		return cr.rwc.Read(p)
+	}
+	if cr.inRead {
+		hijacked := cr.conn.hijacked()
+		cr.unlock()
+		if hijacked {
 			panic("invalid Body.Read call. After hijacked, the original Request must not be used")
 		}
 		panic("invalid concurrent Body.Read call")
@@ -795,12 +835,12 @@ func (cr *connReader) Read(p []byte) (n int, err error) {
 	}
 	cr.inRead = true
 	cr.unlock()
-	n, err = cr.conn.rwc.Read(p)
+	n, err = cr.rwc.Read(p)
 
 	cr.lock()
 	cr.inRead = false
 	if err != nil {
-		cr.handleReadError(err)
+		cr.handleReadErrorLocked(err)
 	}
 	cr.remain -= int64(n)
 	cr.unlock()
@@ -822,6 +862,7 @@ var copyBufPool = sync.Pool{New: func() any { return new([copyBufPoolSize]byte) 
 func getCopyBuf() []byte {
 	return copyBufPool.Get().(*[copyBufPoolSize]byte)[:]
 }
+
 func putCopyBuf(b []byte) {
 	if len(b) != copyBufPoolSize {
 		panic("trying to put back buffer of the wrong size in the copyBufPool")
@@ -839,15 +880,6 @@ func bufioWriterPool(size int) *sync.Pool {
 	return nil
 }
 
-// newBufioReader should be an internal detail,
-// but widely used packages access it using linkname.
-// Notable members of the hall of shame include:
-//   - github.com/gobwas/ws
-//
-// Do not remove or change the type signature.
-// See go.dev/issue/67401.
-//
-//go:linkname newBufioReader
 func newBufioReader(r io.Reader) *bufio.Reader {
 	if v := bufioReaderPool.Get(); v != nil {
 		br := v.(*bufio.Reader)
@@ -859,29 +891,11 @@ func newBufioReader(r io.Reader) *bufio.Reader {
 	return bufio.NewReader(r)
 }
 
-// putBufioReader should be an internal detail,
-// but widely used packages access it using linkname.
-// Notable members of the hall of shame include:
-//   - github.com/gobwas/ws
-//
-// Do not remove or change the type signature.
-// See go.dev/issue/67401.
-//
-//go:linkname putBufioReader
 func putBufioReader(br *bufio.Reader) {
 	br.Reset(nil)
 	bufioReaderPool.Put(br)
 }
 
-// newBufioWriterSize should be an internal detail,
-// but widely used packages access it using linkname.
-// Notable members of the hall of shame include:
-//   - github.com/gobwas/ws
-//
-// Do not remove or change the type signature.
-// See go.dev/issue/67401.
-//
-//go:linkname newBufioWriterSize
 func newBufioWriterSize(w io.Writer, size int) *bufio.Writer {
 	pool := bufioWriterPool(size)
 	if pool != nil {
@@ -894,15 +908,6 @@ func newBufioWriterSize(w io.Writer, size int) *bufio.Writer {
 	return bufio.NewWriterSize(w, size)
 }
 
-// putBufioWriter should be an internal detail,
-// but widely used packages access it using linkname.
-// Notable members of the hall of shame include:
-//   - github.com/gobwas/ws
-//
-// Do not remove or change the type signature.
-// See go.dev/issue/67401.
-//
-//go:linkname putBufioWriter
 func putBufioWriter(bw *bufio.Writer) {
 	bw.Reset(nil)
 	if pool := bufioWriterPool(bw.Available()); pool != nil {
@@ -915,15 +920,15 @@ func putBufioWriter(bw *bufio.Writer) {
 // This can be overridden by setting [Server.MaxHeaderBytes].
 const DefaultMaxHeaderBytes = 1 << 20 // 1 MB
 
-func (srv *Server) maxHeaderBytes() int {
-	if srv.MaxHeaderBytes > 0 {
-		return srv.MaxHeaderBytes
+func (s *Server) maxHeaderBytes() int {
+	if s.MaxHeaderBytes > 0 {
+		return s.MaxHeaderBytes
 	}
 	return DefaultMaxHeaderBytes
 }
 
-func (srv *Server) initialReadLimitSize() int64 {
-	return int64(srv.maxHeaderBytes()) + 4096 // bufio slop
+func (s *Server) initialReadLimitSize() int64 {
+	return int64(s.maxHeaderBytes()) + 4096 // bufio slop
 }
 
 // tlsHandshakeTimeout returns the time limit permitted for the TLS
@@ -931,12 +936,12 @@ func (srv *Server) initialReadLimitSize() int64 {
 //
 // It returns the minimum of any positive ReadHeaderTimeout,
 // ReadTimeout, or WriteTimeout.
-func (srv *Server) tlsHandshakeTimeout() time.Duration {
+func (s *Server) tlsHandshakeTimeout() time.Duration {
 	var ret time.Duration
 	for _, v := range [...]time.Duration{
-		srv.ReadHeaderTimeout,
-		srv.ReadTimeout,
-		srv.WriteTimeout,
+		s.ReadHeaderTimeout,
+		s.ReadTimeout,
+		s.WriteTimeout,
 	} {
 		if v <= 0 {
 			continue
@@ -990,28 +995,6 @@ func (ecr *expectContinueReader) Close() error {
 //
 // For parsing this time format, see [ParseTime].
 const TimeFormat = "Mon, 02 Jan 2006 15:04:05 GMT"
-
-// appendTime is a non-allocating version of []byte(t.UTC().Format(TimeFormat))
-func appendTime(b []byte, t time.Time) []byte {
-	const days = "SunMonTueWedThuFriSat"
-	const months = "JanFebMarAprMayJunJulAugSepOctNovDec"
-
-	t = t.UTC()
-	yy, mm, dd := t.Date()
-	hh, mn, ss := t.Clock()
-	day := days[3*t.Weekday():]
-	mon := months[3*(mm-1):]
-
-	return append(b,
-		day[0], day[1], day[2], ',', ' ',
-		byte('0'+dd/10), byte('0'+dd%10), ' ',
-		mon[0], mon[1], mon[2], ' ',
-		byte('0'+yy/1000), byte('0'+(yy/100)%10), byte('0'+(yy/10)%10), byte('0'+yy%10), ' ',
-		byte('0'+hh/10), byte('0'+hh%10), ':',
-		byte('0'+mn/10), byte('0'+mn%10), ':',
-		byte('0'+ss/10), byte('0'+ss%10), ' ',
-		'G', 'M', 'T')
-}
 
 var errTooLarge = errors.New("http: request too large")
 
@@ -1100,7 +1083,6 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 		reqBody:       req.Body,
 		handlerHeader: make(Header),
 		contentLength: -1,
-		closeNotifyCh: make(chan bool, 1),
 
 		// We populate these ahead of time so we're not
 		// reading from req.Header after their Handler starts
@@ -1171,7 +1153,7 @@ func checkWriteHeaderCode(code int) {
 	}
 }
 
-// relevantCaller searches the call stack for the first function outside of github.com/wangluozhe/chttp.
+// relevantCaller searches the call stack for the first function outside of net/http.
 // The purpose of this function is to provide more helpful error messages.
 func relevantCaller() runtime.Frame {
 	pc := make([]uintptr, 16)
@@ -1179,8 +1161,9 @@ func relevantCaller() runtime.Frame {
 	frames := runtime.CallersFrames(pc[:n])
 	var frame runtime.Frame
 	for {
-		frame, more := frames.Next()
-		if !strings.HasPrefix(frame.Function, "github.com/wangluozhe/chttp.") {
+		var more bool
+		frame, more = frames.Next()
+		if !strings.HasPrefix(frame.Function, "net/http.") {
 			return frame
 		}
 		if !more {
@@ -1506,7 +1489,7 @@ func (cw *chunkWriter) writeHeader(p []byte) {
 	}
 
 	if !header.has("Date") {
-		setHeader.date = appendTime(cw.res.dateBuf[:0], time.Now())
+		setHeader.date = time.Now().UTC().AppendFormat(cw.res.dateBuf[:0], TimeFormat)
 	}
 
 	if hasCL && hasTE && te != "identity" {
@@ -1590,7 +1573,7 @@ func foreachHeaderElement(v string, fn func(string)) {
 		fn(v)
 		return
 	}
-	for _, f := range strings.Split(v, ",") {
+	for f := range strings.SplitSeq(v, ",") {
 		if f = textproto.TrimString(f); f != "" {
 			fn(f)
 		}
@@ -1622,7 +1605,7 @@ func writeStatusLine(bw *bufio.Writer, is11 bool, code int, scratch []byte) {
 // It's illegal to call this before the header has been flushed.
 func (w *response) bodyAllowed() bool {
 	if !w.wroteHeader {
-		panic("")
+		panic("net/http: bodyAllowed called before the header was written")
 	}
 	return bodyAllowedForStatus(w.status)
 }
@@ -1914,7 +1897,7 @@ func (e statusError) Error() string { return StatusText(e.code) + ": " + e.text 
 // While any panic from ServeHTTP aborts the response to the client,
 // panicking with ErrAbortHandler also suppresses logging of a stack
 // trace to the server's error log.
-var ErrAbortHandler = errors.New("github.com/wangluozhe/chttp: abort Handler")
+var ErrAbortHandler = internal.ErrAbortHandler
 
 // isCommonNetReadError reports whether err is a common error
 // encountered during reading a request off the network when the
@@ -1931,6 +1914,10 @@ func isCommonNetReadError(err error) bool {
 		return true
 	}
 	return false
+}
+
+type connectionStater interface {
+	ConnectionState() tls.ConnectionState
 }
 
 // Serve a new connection.
@@ -2005,19 +1992,40 @@ func (c *conn) serve(ctx context.Context) {
 
 	// HTTP/1.x from here on.
 
+	// Set Request.TLS if the conn is not a *tls.Conn, but implements ConnectionState.
+	if c.tlsState == nil {
+		if tc, ok := c.rwc.(connectionStater); ok {
+			c.tlsState = new(tls.ConnectionState)
+			*c.tlsState = tc.ConnectionState()
+		}
+	}
+
 	ctx, cancelCtx := context.WithCancel(ctx)
 	c.cancelCtx = cancelCtx
 	defer cancelCtx()
 
-	c.r = &connReader{conn: c}
+	c.r = &connReader{conn: c, rwc: c.rwc}
 	c.bufr = newBufioReader(c.r)
 	c.bufw = newBufioWriterSize(checkConnErrorWriter{c}, 4<<10)
+
+	protos := c.server.protocols()
+	if c.tlsState == nil && protos.UnencryptedHTTP2() {
+		if c.maybeServeUnencryptedHTTP2(ctx) {
+			return
+		}
+	}
+	if !protos.HTTP1() {
+		return
+	}
 
 	for {
 		w, err := c.readRequest(ctx)
 		if c.r.remain != c.server.initialReadLimitSize() {
 			// If we read any bytes off the wire, we're active.
 			c.setState(c.rwc, StateActive, runHooks)
+		}
+		if c.server.shuttingDown() {
+			return
 		}
 		if err != nil {
 			const errorHeaders = "\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n"
@@ -2093,6 +2101,7 @@ func (c *conn) serve(ctx context.Context) {
 		inFlightResponse = nil
 		w.cancelCtx()
 		if c.hijacked() {
+			c.r.releaseConn()
 			return
 		}
 		w.finishRequest()
@@ -2132,6 +2141,74 @@ func (c *conn) serve(ctx context.Context) {
 	}
 }
 
+// unencryptedHTTP2Request is an HTTP handler that initializes
+// certain uninitialized fields in its *Request.
+//
+// It's the unencrypted version of initALPNRequest.
+type unencryptedHTTP2Request struct {
+	ctx context.Context
+	c   net.Conn
+	h   serverHandler
+}
+
+func (h unencryptedHTTP2Request) BaseContext() context.Context { return h.ctx }
+
+func (h unencryptedHTTP2Request) ServeHTTP(rw ResponseWriter, req *Request) {
+	if req.Body == nil {
+		req.Body = NoBody
+	}
+	if req.RemoteAddr == "" {
+		req.RemoteAddr = h.c.RemoteAddr().String()
+	}
+	h.h.ServeHTTP(rw, req)
+}
+
+// unencryptedNetConnInTLSConn is used to pass an unencrypted net.Conn to
+// functions that only accept a *tls.Conn.
+type unencryptedNetConnInTLSConn struct {
+	net.Conn // panic on all net.Conn methods
+	conn     net.Conn
+}
+
+func (c unencryptedNetConnInTLSConn) UnencryptedNetConn() net.Conn {
+	return c.conn
+}
+
+func unencryptedTLSConn(c net.Conn) *tls.Conn {
+	return tls.Client(unencryptedNetConnInTLSConn{conn: c}, nil)
+}
+
+func unencryptedTLSUConn(c net.Conn) *tls.UConn {
+	return tls.UClient(unencryptedNetConnInTLSConn{conn: c}, nil, tls.HelloCustom)
+}
+
+// TLSNextProto key to use for unencrypted HTTP/2 connections.
+// Not actually a TLS-negotiated protocol.
+const nextProtoUnencryptedHTTP2 = "unencrypted_http2"
+
+func (c *conn) maybeServeUnencryptedHTTP2(ctx context.Context) bool {
+	fn, ok := c.server.TLSNextProto[nextProtoUnencryptedHTTP2]
+	if !ok {
+		return false
+	}
+	hasPreface := func(c *conn, preface []byte) bool {
+		c.r.setReadLimit(int64(len(preface)) - int64(c.bufr.Buffered()))
+		got, err := c.bufr.Peek(len(preface))
+		c.r.setInfiniteReadLimit()
+		return err == nil && bytes.Equal(got, preface)
+	}
+	if !hasPreface(c, []byte("PRI * HTTP/2.0")) {
+		return false
+	}
+	if !hasPreface(c, []byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")) {
+		return false
+	}
+	c.setState(c.rwc, StateActive, skipHooks)
+	h := unencryptedHTTP2Request{ctx, c.rwc, serverHandler{c.server}}
+	fn(c.server, unencryptedTLSConn(c.rwc), h)
+	return true
+}
+
 func (w *response) sendExpectationFailed() {
 	// TODO(bradfitz): let ServeHTTP handlers handle
 	// requests with non-standard expectation[s]? Seems
@@ -2154,7 +2231,7 @@ func (w *response) sendExpectationFailed() {
 // and a [Hijacker].
 func (w *response) Hijack() (rwc net.Conn, buf *bufio.ReadWriter, err error) {
 	if w.handlerDone.Load() {
-		panic("github.com/wangluozhe/chttp: Hijack called after ServeHTTP finished")
+		panic("net/http: Hijack called after ServeHTTP finished")
 	}
 	w.disableWriteContinue()
 	if w.wroteHeader {
@@ -2176,10 +2253,30 @@ func (w *response) Hijack() (rwc net.Conn, buf *bufio.ReadWriter, err error) {
 }
 
 func (w *response) CloseNotify() <-chan bool {
+	w.lazyCloseNotifyMu.Lock()
+	defer w.lazyCloseNotifyMu.Unlock()
 	if w.handlerDone.Load() {
-		panic("github.com/wangluozhe/chttp: CloseNotify called after ServeHTTP finished")
+		panic("net/http: CloseNotify called after ServeHTTP finished")
+	}
+	if w.closeNotifyCh == nil {
+		w.closeNotifyCh = make(chan bool, 1)
+		if w.closeNotifyTriggered {
+			w.closeNotifyCh <- true // action prior closeNotify call
+		}
 	}
 	return w.closeNotifyCh
+}
+
+func (w *response) closeNotify() {
+	w.lazyCloseNotifyMu.Lock()
+	defer w.lazyCloseNotifyMu.Unlock()
+	if w.closeNotifyTriggered {
+		return // already triggered
+	}
+	w.closeNotifyTriggered = true
+	if w.closeNotifyCh != nil {
+		w.closeNotifyCh <- true
+	}
 }
 
 func registerOnHitEOF(rc io.ReadCloser, fn func()) {
@@ -2288,6 +2385,8 @@ func StripPrefix(prefix string, h Handler) Handler {
 
 // Redirect replies to the request with a redirect to url,
 // which may be a path relative to the request path.
+// Any non-ASCII characters in url will be percent-encoded,
+// but existing percent encodings will not be changed.
 //
 // The provided code should be in the 3xx range and is usually
 // [StatusMovedPermanently], [StatusFound] or [StatusSeeOther].
@@ -2304,7 +2403,7 @@ func Redirect(w ResponseWriter, r *Request, url string, code int) {
 		// but doing it ourselves is more reliable.
 		// See RFC 7231, section 7.1.2
 		if u.Scheme == "" && u.Host == "" {
-			oldpath := r.URL.Path
+			oldpath := r.URL.EscapedPath()
 			if oldpath == "" { // should not happen, but avoid a crash if it does
 				oldpath = "/"
 			}
@@ -2480,6 +2579,8 @@ func RedirectHandler(url string, code int) Handler {
 // ServeMux also takes care of sanitizing the URL request path and the Host
 // header, stripping the port number and redirecting any request containing . or
 // .. segments or repeated slashes to an equivalent, cleaner URL.
+// Escaped path elements such as "%2e" for "." and "%2f" for "/" are preserved
+// and aren't considered separators for request routing.
 //
 // # Compatibility
 //
@@ -2503,11 +2604,10 @@ func RedirectHandler(url string, code int) Handler {
 //     This change mostly affects how paths with %2F escapes adjacent to slashes are treated.
 //     See https://go.dev/issue/21955 for details.
 type ServeMux struct {
-	mu       sync.RWMutex
-	tree     routingNode
-	index    routingIndex
-	patterns []*pattern  // TODO(jba): remove if possible
-	mux121   serveMux121 // used only when GODEBUG=httpmuxgo121=1
+	mu     sync.RWMutex
+	tree   routingNode
+	index  routingIndex
+	mux121 serveMux121 // used only when GODEBUG=httpmuxgo121=1
 }
 
 // NewServeMux allocates and returns a new [ServeMux].
@@ -2569,7 +2669,12 @@ func stripHostPort(h string) string {
 // the path that will match after following the redirect.
 //
 // If there is no registered handler that applies to the request,
-// Handler returns a “page not found” handler and an empty pattern.
+// Handler returns a “page not found” or “method not supported”
+// handler and an empty pattern.
+//
+// Handler does not modify its argument. In particular, it does not
+// populate named path wildcards, so r.PathValue will always return
+// the empty string.
 func (mux *ServeMux) Handler(r *Request) (h Handler, pattern string) {
 	if use121 {
 		return mux.mux121.findHandler(r)
@@ -2594,7 +2699,7 @@ func (mux *ServeMux) findHandler(r *Request) (h Handler, patStr string, _ *patte
 		// but the path canonicalization does not.
 		_, _, u := mux.matchOrRedirect(host, r.Method, path, r.URL)
 		if u != nil {
-			return RedirectHandler(u.String(), StatusMovedPermanently), u.Path, nil, nil
+			return RedirectHandler(u.String(), StatusTemporaryRedirect), u.Path, nil, nil
 		}
 		// Redo the match, this time with r.Host instead of r.URL.Host.
 		// Pass a nil URL to skip the trailing-slash redirect logic.
@@ -2610,7 +2715,7 @@ func (mux *ServeMux) findHandler(r *Request) (h Handler, patStr string, _ *patte
 		var u *url.URL
 		n, matches, u = mux.matchOrRedirect(host, r.Method, path, r.URL)
 		if u != nil {
-			return RedirectHandler(u.String(), StatusMovedPermanently), u.Path, nil, nil
+			return RedirectHandler(u.String(), StatusTemporaryRedirect), n.pattern.String(), nil, nil
 		}
 		if path != escapedPath {
 			// Redirect to cleaned path.
@@ -2619,7 +2724,7 @@ func (mux *ServeMux) findHandler(r *Request) (h Handler, patStr string, _ *patte
 				patStr = n.pattern.String()
 			}
 			u := &url.URL{Path: path, RawQuery: r.URL.RawQuery}
-			return RedirectHandler(u.String(), StatusMovedPermanently), patStr, nil, nil
+			return RedirectHandler(u.String(), StatusTemporaryRedirect), patStr, nil, nil
 		}
 	}
 	if n == nil {
@@ -2649,14 +2754,21 @@ func (mux *ServeMux) matchOrRedirect(host, method, path string, u *url.URL) (_ *
 	defer mux.mu.RUnlock()
 
 	n, matches := mux.tree.match(host, method, path)
-	// If we have an exact match, or we were asked not to try trailing-slash redirection,
-	// or the URL already has a trailing slash, then we're done.
-	if !exactMatch(n, path) && u != nil && !strings.HasSuffix(path, "/") {
+	// We can terminate here if any of the following is true:
+	// - We have an exact match already.
+	// - We were asked not to try trailing slash redirection.
+	// - The URL already has a trailing slash.
+	// - The URL is an empty string.
+	if !exactMatch(n, path) && u != nil && !strings.HasSuffix(path, "/") && path != "" {
 		// If there is an exact match with a trailing slash, then redirect.
 		path += "/"
 		n2, _ := mux.tree.match(host, method, path)
 		if exactMatch(n2, path) {
-			return nil, nil, &url.URL{Path: cleanPath(u.Path) + "/", RawQuery: u.RawQuery}
+			// It is safe to return n2 here: it is used only in the second RedirectHandler case
+			// of findHandler, and that method returns before it does the "n == nil" check where
+			// the first return value matters. We return it here only to make the pattern available
+			// to findHandler.
+			return n2, nil, &url.URL{Path: cleanPath(u.Path) + "/", RawQuery: u.RawQuery}
 		}
 	}
 	return n, matches, nil
@@ -2751,8 +2863,10 @@ func (mux *ServeMux) ServeHTTP(w ResponseWriter, r *Request) {
 // always refers to user code.
 
 // Handle registers the handler for the given pattern.
-// If the given pattern conflicts, with one that is already registered, Handle
-// panics.
+// If the given pattern conflicts with one that is already registered
+// or if the pattern is invalid, Handle panics.
+//
+// See [ServeMux] for details on valid patterns and conflict rules.
 func (mux *ServeMux) Handle(pattern string, handler Handler) {
 	if use121 {
 		mux.mux121.handle(pattern, handler)
@@ -2762,8 +2876,10 @@ func (mux *ServeMux) Handle(pattern string, handler Handler) {
 }
 
 // HandleFunc registers the handler function for the given pattern.
-// If the given pattern conflicts, with one that is already registered, HandleFunc
-// panics.
+// If the given pattern conflicts with one that is already registered
+// or if the pattern is invalid, HandleFunc panics.
+//
+// See [ServeMux] for details on valid patterns and conflict rules.
 func (mux *ServeMux) HandleFunc(pattern string, handler func(ResponseWriter, *Request)) {
 	if use121 {
 		mux.mux121.handleFunc(pattern, handler)
@@ -2838,7 +2954,6 @@ func (mux *ServeMux) registerErr(patstr string, handler Handler) error {
 	}
 	mux.tree.addPattern(pat, handler)
 	mux.index.addPattern(pat)
-	mux.patterns = append(mux.patterns, pat)
 	return nil
 }
 
@@ -2946,6 +3061,9 @@ type Server struct {
 	// automatically closed when the function returns.
 	// If TLSNextProto is not nil, HTTP/2 support is not enabled
 	// automatically.
+	//
+	// Historically, TLSNextProto was used to disable HTTP/2 support.
+	// The Server.Protocols field now provides a simpler way to do this.
 	TLSNextProto map[string]func(*Server, *tls.Conn, Handler)
 
 	// ConnState specifies an optional callback function that is
@@ -2973,6 +3091,31 @@ type Server struct {
 	// value.
 	ConnContext func(ctx context.Context, c net.Conn) context.Context
 
+	// HTTP2 configures HTTP/2 connections.
+	HTTP2 *HTTP2Config
+
+	// Protocols is the set of protocols accepted by the server.
+	//
+	// If Protocols includes UnencryptedHTTP2, the server will accept
+	// unencrypted HTTP/2 connections. The server can serve both
+	// HTTP/1 and unencrypted HTTP/2 on the same address and port.
+	//
+	// If Protocols is nil, the default is usually HTTP/1 and HTTP/2.
+	// If TLSNextProto is non-nil and does not contain an "h2" entry,
+	// the default is HTTP/1 only.
+	Protocols *Protocols
+
+	// DisableClientPriority specifies whether client-specified priority, as
+	// specified in RFC 9218, should be respected or not.
+	//
+	// This field only takes effect if using HTTP/2, and if no custom write
+	// scheduler is defined for the HTTP/2 server. Otherwise, this field is a
+	// no-op.
+	//
+	// If set to true, requests will be served in a round-robin manner, without
+	// prioritization.
+	DisableClientPriority bool
+
 	inShutdown atomic.Bool // true when server is in shutdown
 
 	disableKeepAlives atomic.Bool
@@ -2983,6 +3126,8 @@ type Server struct {
 	listeners  map[*net.Listener]struct{}
 	activeConn map[*conn]struct{}
 	onShutdown []func()
+	h2         *http2Server
+	h3         *http3ServerHandler
 
 	listenerGroup sync.WaitGroup
 }
@@ -2996,23 +3141,23 @@ type Server struct {
 //
 // Close returns any error returned from closing the [Server]'s
 // underlying Listener(s).
-func (srv *Server) Close() error {
-	srv.inShutdown.Store(true)
-	srv.mu.Lock()
-	defer srv.mu.Unlock()
-	err := srv.closeListenersLocked()
+func (s *Server) Close() error {
+	s.inShutdown.Store(true)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	err := s.closeListenersLocked()
 
-	// Unlock srv.mu while waiting for listenerGroup.
-	// The group Add and Done calls are made with srv.mu held,
+	// Unlock s.mu while waiting for listenerGroup.
+	// The group Add and Done calls are made with s.mu held,
 	// to avoid adding a new listener in the window between
 	// us setting inShutdown above and waiting here.
-	srv.mu.Unlock()
-	srv.listenerGroup.Wait()
-	srv.mu.Lock()
+	s.mu.Unlock()
+	s.listenerGroup.Wait()
+	s.mu.Lock()
 
-	for c := range srv.activeConn {
+	for c := range s.activeConn {
 		c.rwc.Close()
-		delete(srv.activeConn, c)
+		delete(s.activeConn, c)
 	}
 	return err
 }
@@ -3034,7 +3179,7 @@ const shutdownPollIntervalMax = 500 * time.Millisecond
 // Shutdown returns the context's error, otherwise it returns any
 // error returned from closing the [Server]'s underlying Listener(s).
 //
-// When Shutdown is called, [Serve], [ListenAndServe], and
+// When Shutdown is called, [Serve], [ServeTLS], [ListenAndServe], and
 // [ListenAndServeTLS] immediately return [ErrServerClosed]. Make sure the
 // program doesn't exit and waits instead for Shutdown to return.
 //
@@ -3046,21 +3191,24 @@ const shutdownPollIntervalMax = 500 * time.Millisecond
 //
 // Once Shutdown has been called on a server, it may not be reused;
 // future calls to methods such as Serve will return ErrServerClosed.
-func (srv *Server) Shutdown(ctx context.Context) error {
-	srv.inShutdown.Store(true)
+func (s *Server) Shutdown(ctx context.Context) error {
+	s.inShutdown.Store(true)
 
-	srv.mu.Lock()
-	lnerr := srv.closeListenersLocked()
-	for _, f := range srv.onShutdown {
+	s.mu.Lock()
+	if s.h3 != nil {
+		s.h3.shutdownCtx = ctx
+	}
+	lnerr := s.closeListenersLocked()
+	for _, f := range s.onShutdown {
 		go f()
 	}
-	srv.mu.Unlock()
-	srv.listenerGroup.Wait()
+	s.mu.Unlock()
+	s.listenerGroup.Wait()
 
 	pollIntervalBase := time.Millisecond
 	nextPollInterval := func() time.Duration {
 		// Add 10% jitter.
-		interval := pollIntervalBase + time.Duration(rand.Intn(int(pollIntervalBase/10)))
+		interval := pollIntervalBase + time.Duration(rand.IntN(int(pollIntervalBase/10)))
 		// Double and clamp for next time.
 		pollIntervalBase *= 2
 		if pollIntervalBase > shutdownPollIntervalMax {
@@ -3072,7 +3220,7 @@ func (srv *Server) Shutdown(ctx context.Context) error {
 	timer := time.NewTimer(nextPollInterval())
 	defer timer.Stop()
 	for {
-		if srv.closeIdleConns() {
+		if s.closeIdleConns() {
 			return lnerr
 		}
 		select {
@@ -3089,10 +3237,10 @@ func (srv *Server) Shutdown(ctx context.Context) error {
 // undergone ALPN protocol upgrade or that have been hijacked.
 // This function should start protocol-specific graceful shutdown,
 // but should not wait for shutdown to complete.
-func (srv *Server) RegisterOnShutdown(f func()) {
-	srv.mu.Lock()
-	srv.onShutdown = append(srv.onShutdown, f)
-	srv.mu.Unlock()
+func (s *Server) RegisterOnShutdown(f func()) {
+	s.mu.Lock()
+	s.onShutdown = append(s.onShutdown, f)
+	s.mu.Unlock()
 }
 
 // closeIdleConns closes all idle connections and reports whether the
@@ -3197,7 +3345,7 @@ type serverHandler struct {
 // Do not remove or change the type signature.
 // See go.dev/issue/67401.
 //
-//go:linkname badServeHTTP github.com/wangluozhe/chttp.serverHandler.ServeHTTP
+//go:linkname badServeHTTP net/http.serverHandler.ServeHTTP
 func (sh serverHandler) ServeHTTP(rw ResponseWriter, req *Request) {
 	handler := sh.srv.Handler
 	if handler == nil {
@@ -3236,19 +3384,19 @@ func AllowQuerySemicolons(h Handler) Handler {
 	})
 }
 
-// ListenAndServe listens on the TCP network address srv.Addr and then
+// ListenAndServe listens on the TCP network address s.Addr and then
 // calls [Serve] to handle requests on incoming connections.
 // Accepted connections are configured to enable TCP keep-alives.
 //
-// If srv.Addr is blank, ":http" is used.
+// If s.Addr is blank, ":http" is used.
 //
 // ListenAndServe always returns a non-nil error. After [Server.Shutdown] or [Server.Close],
 // the returned error is [ErrServerClosed].
-func (srv *Server) ListenAndServe() error {
-	if srv.shuttingDown() {
+func (s *Server) ListenAndServe() error {
+	if s.shuttingDown() {
 		return ErrServerClosed
 	}
-	addr := srv.Addr
+	addr := s.Addr
 	if addr == "" {
 		addr = ":http"
 	}
@@ -3256,21 +3404,24 @@ func (srv *Server) ListenAndServe() error {
 	if err != nil {
 		return err
 	}
-	return srv.Serve(ln)
+	return s.Serve(ln)
 }
 
 var testHookServerServe func(*Server, net.Listener) // used if non-nil
 
 // shouldConfigureHTTP2ForServe reports whether Server.Serve should configure
-// automatic HTTP/2. (which sets up the srv.TLSNextProto map)
-func (srv *Server) shouldConfigureHTTP2ForServe() bool {
-	if srv.TLSConfig == nil {
+// automatic HTTP/2. (which sets up the s.TLSNextProto map)
+func (s *Server) shouldConfigureHTTP2ForServe() bool {
+	if s.TLSConfig == nil {
 		// Compatibility with Go 1.6:
 		// If there's no TLSConfig, it's possible that the user just
 		// didn't set it on the http.Server, but did pass it to
 		// tls.NewListener and passed that listener to Serve.
-		// So we should configure HTTP/2 (to set up srv.TLSNextProto)
+		// So we should configure HTTP/2 (to set up s.TLSNextProto)
 		// in case the listener returns an "h2" *tls.Conn.
+		return true
+	}
+	if s.protocols().UnencryptedHTTP2() {
 		return true
 	}
 	// The user specified a TLSConfig on their http.Server.
@@ -3280,7 +3431,7 @@ func (srv *Server) shouldConfigureHTTP2ForServe() bool {
 	// passed this tls.Config to tls.NewListener. And if they did,
 	// it's too late anyway to fix it. It would only be potentially racy.
 	// See Issue 15908.
-	return slices.Contains(srv.TLSConfig.NextProtos, http2NextProtoTLS)
+	return slices.Contains(s.TLSConfig.NextProtos, "h2")
 }
 
 // ErrServerClosed is returned by the [Server.Serve], [ServeTLS], [ListenAndServe],
@@ -3289,7 +3440,7 @@ var ErrServerClosed = errors.New("http: Server closed")
 
 // Serve accepts incoming connections on the Listener l, creating a
 // new service goroutine for each. The service goroutines read requests and
-// then call srv.Handler to reply to them.
+// then call s.Handler to reply to them.
 //
 // HTTP/2 support is only enabled if the Listener returns [*tls.Conn]
 // connections and they were configured with "h2" in the TLS
@@ -3297,27 +3448,27 @@ var ErrServerClosed = errors.New("http: Server closed")
 //
 // Serve always returns a non-nil error and closes l.
 // After [Server.Shutdown] or [Server.Close], the returned error is [ErrServerClosed].
-func (srv *Server) Serve(l net.Listener) error {
+func (s *Server) Serve(l net.Listener) error {
 	if fn := testHookServerServe; fn != nil {
-		fn(srv, l) // call hook with unwrapped listener
+		fn(s, l) // call hook with unwrapped listener
 	}
 
 	origListener := l
 	l = &onceCloseListener{Listener: l}
 	defer l.Close()
 
-	if err := srv.setupHTTP2_Serve(); err != nil {
+	if err := s.setupHTTP2_Serve(); err != nil {
 		return err
 	}
 
-	if !srv.trackListener(&l, true) {
+	if !s.trackListener(&l, true) {
 		return ErrServerClosed
 	}
-	defer srv.trackListener(&l, false)
+	defer s.trackListener(&l, false)
 
 	baseCtx := context.Background()
-	if srv.BaseContext != nil {
-		baseCtx = srv.BaseContext(origListener)
+	if s.BaseContext != nil {
+		baseCtx = s.BaseContext(origListener)
 		if baseCtx == nil {
 			panic("BaseContext returned a nil context")
 		}
@@ -3325,11 +3476,11 @@ func (srv *Server) Serve(l net.Listener) error {
 
 	var tempDelay time.Duration // how long to sleep on accept failure
 
-	ctx := context.WithValue(baseCtx, ServerContextKey, srv)
+	ctx := context.WithValue(baseCtx, ServerContextKey, s)
 	for {
 		rw, err := l.Accept()
 		if err != nil {
-			if srv.shuttingDown() {
+			if s.shuttingDown() {
 				return ErrServerClosed
 			}
 			if ne, ok := err.(net.Error); ok && ne.Temporary() {
@@ -3341,29 +3492,45 @@ func (srv *Server) Serve(l net.Listener) error {
 				if max := 1 * time.Second; tempDelay > max {
 					tempDelay = max
 				}
-				srv.logf("http: Accept error: %v; retrying in %v", err, tempDelay)
+				s.logf("http: Accept error: %v; retrying in %v", err, tempDelay)
 				time.Sleep(tempDelay)
 				continue
 			}
 			return err
 		}
 		connCtx := ctx
-		if cc := srv.ConnContext; cc != nil {
+		if cc := s.ConnContext; cc != nil {
 			connCtx = cc(connCtx, rw)
 			if connCtx == nil {
 				panic("ConnContext returned nil")
 			}
 		}
 		tempDelay = 0
-		c := srv.newConn(rw)
+		c := s.newConn(rw)
 		c.setState(c.rwc, StateNew, runHooks) // before Serve can return
 		go c.serve(connCtx)
 	}
 }
 
+func (s *Server) setupTLSConfig(certFile, keyFile string, nextProtos []string) (*tls.Config, error) {
+	config := cloneTLSConfig(s.TLSConfig)
+	config.NextProtos = nextProtos
+
+	configHasCert := len(config.Certificates) > 0 || config.GetCertificate != nil || config.GetConfigForClient != nil
+	if !configHasCert || certFile != "" || keyFile != "" {
+		var err error
+		config.Certificates = make([]tls.Certificate, 1)
+		config.Certificates[0], err = tls.LoadX509KeyPair(certFile, keyFile)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return config, nil
+}
+
 // ServeTLS accepts incoming connections on the Listener l, creating a
 // new service goroutine for each. The service goroutines perform TLS
-// setup and then read requests, calling srv.Handler to reply to them.
+// setup and then read requests, calling s.Handler to reply to them.
 //
 // Files containing a certificate and matching private key for the
 // server must be provided if neither the [Server]'s
@@ -3375,30 +3542,92 @@ func (srv *Server) Serve(l net.Listener) error {
 //
 // ServeTLS always returns a non-nil error. After [Server.Shutdown] or [Server.Close], the
 // returned error is [ErrServerClosed].
-func (srv *Server) ServeTLS(l net.Listener, certFile, keyFile string) error {
-	// Setup HTTP/2 before srv.Serve, to initialize srv.TLSConfig
+func (s *Server) ServeTLS(l net.Listener, certFile, keyFile string) error {
+	// Setup HTTP/2 before s.Serve, to initialize s.TLSConfig
 	// before we clone it and create the TLS Listener.
-	if err := srv.setupHTTP2_ServeTLS(); err != nil {
+	if err := s.setupHTTP2_ServeTLS(); err != nil {
 		return err
 	}
 
-	config := cloneTLSConfig(srv.TLSConfig)
-	if !slices.Contains(config.NextProtos, "http/1.1") {
-		config.NextProtos = append(config.NextProtos, "http/1.1")
+	var nextProtos []string
+	if s.TLSConfig != nil {
+		nextProtos = s.TLSConfig.NextProtos
 	}
-
-	configHasCert := len(config.Certificates) > 0 || config.GetCertificate != nil || config.GetConfigForClient != nil
-	if !configHasCert || certFile != "" || keyFile != "" {
-		var err error
-		config.Certificates = make([]tls.Certificate, 1)
-		config.Certificates[0], err = tls.LoadX509KeyPair(certFile, keyFile)
-		if err != nil {
-			return err
-		}
+	config, err := s.setupTLSConfig(certFile, keyFile, adjustNextProtos(nextProtos, s.protocols()))
+	if err != nil {
+		return err
 	}
 
 	tlsListener := tls.NewListener(l, config)
-	return srv.Serve(tlsListener)
+	return s.Serve(tlsListener)
+}
+
+func (s *Server) protocols() Protocols {
+	if s.Protocols != nil {
+		// Historically, even when Protocols for a Server was set to be empty,
+		// the Server can still run normally with just HTTP/1.
+		// To keep backward-compatibility, the zero value of Protocols is
+		// defined as having only HTTP/1 enabled.
+		if s.Protocols.empty() {
+			var p Protocols
+			p.SetHTTP1(true)
+			return p
+		}
+		return *s.Protocols // user-configured set
+	}
+
+	// The historic way of disabling HTTP/2 is to set TLSNextProto to
+	// a non-nil map with no "h2" entry.
+	_, hasH2 := s.TLSNextProto["h2"]
+	http2Disabled := s.TLSNextProto != nil && !hasH2
+
+	// If GODEBUG=http2server=0, then HTTP/2 is disabled unless
+	// the user has manually added an "h2" entry to TLSNextProto
+	// (probably by using x/net/http2 directly).
+	if http2server.Value() == "0" && !hasH2 {
+		http2Disabled = true
+	}
+
+	var p Protocols
+	p.SetHTTP1(true) // default always includes HTTP/1
+	if !http2Disabled {
+		p.SetHTTP2(true)
+	}
+	return p
+}
+
+// adjustNextProtos adds or removes "http/1.1" and "h2" entries from
+// a tls.Config.NextProtos list, according to the set of protocols in protos.
+func adjustNextProtos(nextProtos []string, protos Protocols) []string {
+	// Make a copy of NextProtos since it might be shared with some other tls.Config.
+	// (tls.Config.Clone doesn't do a deep copy.)
+	//
+	// We could avoid an allocation in the common case by checking to see if the slice
+	// is already in order, but this is just one small allocation per connection.
+	nextProtos = slices.Clone(nextProtos)
+	var have Protocols
+	nextProtos = slices.DeleteFunc(nextProtos, func(s string) bool {
+		switch s {
+		case "http/1.1":
+			if !protos.HTTP1() {
+				return true
+			}
+			have.SetHTTP1(true)
+		case "h2":
+			if !protos.HTTP2() {
+				return true
+			}
+			have.SetHTTP2(true)
+		}
+		return false
+	})
+	if protos.HTTP2() && !have.HTTP2() {
+		nextProtos = append(nextProtos, "h2")
+	}
+	if protos.HTTP1() && !have.HTTP1() {
+		nextProtos = append(nextProtos, "http/1.1")
+	}
+	return nextProtos
 }
 
 // trackListener adds or removes a net.Listener to the set of tracked
@@ -3469,15 +3698,15 @@ func (s *Server) shuttingDown() bool {
 // By default, keep-alives are always enabled. Only very
 // resource-constrained environments or servers in the process of
 // shutting down should disable them.
-func (srv *Server) SetKeepAlivesEnabled(v bool) {
+func (s *Server) SetKeepAlivesEnabled(v bool) {
 	if v {
-		srv.disableKeepAlives.Store(false)
+		s.disableKeepAlives.Store(false)
 		return
 	}
-	srv.disableKeepAlives.Store(true)
+	s.disableKeepAlives.Store(true)
 
 	// Close idle HTTP/1 conns:
-	srv.closeIdleConns()
+	s.closeIdleConns()
 
 	// TODO: Issue 26303: close HTTP/2 conns as soon as they become idle.
 }
@@ -3524,7 +3753,62 @@ func ListenAndServeTLS(addr, certFile, keyFile string, handler Handler) error {
 	return server.ListenAndServeTLS(certFile, keyFile)
 }
 
-// ListenAndServeTLS listens on the TCP network address srv.Addr and
+// http3ServerHandler implements an interface in an external library that
+// supports HTTP/3, allowing an external implementation of HTTP/3 to be used
+// via net/http. See https://go.dev/issue/77440 for details.
+//
+// This is currently only used with golang.org/x/net/internal/http3, to allow
+// us to test our HTTP/3 implementation againts tests in net/http. HTTP/3 is
+// not yet accessible to end-users.
+type http3ServerHandler struct {
+	handler     serverHandler
+	tlsConfig   *tls.Config
+	baseCtx     context.Context
+	errc        chan error
+	shutdownCtx context.Context
+}
+
+// ServeHTTP ensures that http3ServerHandler implements the Handler interface,
+// and gives an HTTP/3 server implementation access to the net/http handler.
+func (h *http3ServerHandler) ServeHTTP(w ResponseWriter, r *Request) {
+	h.handler.ServeHTTP(w, r)
+}
+
+// Addr gives an HTTP/3 server implementation the address that it should listen
+// on.
+func (h *http3ServerHandler) Addr() string {
+	return h.handler.srv.Addr
+}
+
+// TLSConfig gives an HTTP/3 server implementation the *tls.Config that it
+// should use.
+func (h *http3ServerHandler) TLSConfig() *tls.Config {
+	return h.tlsConfig
+}
+
+// BaseContext gives an HTTP/3 server implementation the base context to use
+// for server requests.
+func (h *http3ServerHandler) BaseContext() context.Context {
+	return h.baseCtx
+}
+
+// ListenErrHook should be called by an HTTP/3 server implementation to
+// propagate any error it encounters when trying to listen, if any, to
+// net/http.
+func (h *http3ServerHandler) ListenErrHook(err error) {
+	h.errc <- err
+}
+
+// ShutdownContext gives an HTTP/3 server implementation the context that is
+// used when [Server.Shutdown] is called. This allows an HTTP/3 server
+// implementation to know how long it can take to gracefully shutdown in the
+// function it registers with [Server.RegisterOnShutdown]. Callers must not use
+// this method for any other purpose.
+func (h *http3ServerHandler) ShutdownContext() context.Context {
+	return h.shutdownCtx
+}
+
+// ListenAndServeTLS listens on the TCP network address s.Addr and
 // then calls [ServeTLS] to handle requests on incoming TLS connections.
 // Accepted connections are configured to enable TCP keep-alives.
 //
@@ -3535,75 +3819,107 @@ func ListenAndServeTLS(addr, certFile, keyFile string, handler Handler) error {
 // concatenation of the server's certificate, any intermediates, and
 // the CA's certificate.
 //
-// If srv.Addr is blank, ":https" is used.
+// If s.Addr is blank, ":https" is used.
 //
 // ListenAndServeTLS always returns a non-nil error. After [Server.Shutdown] or
 // [Server.Close], the returned error is [ErrServerClosed].
-func (srv *Server) ListenAndServeTLS(certFile, keyFile string) error {
-	if srv.shuttingDown() {
+func (s *Server) ListenAndServeTLS(certFile, keyFile string) error {
+	if s.shuttingDown() {
 		return ErrServerClosed
 	}
-	addr := srv.Addr
+	addr := s.Addr
 	if addr == "" {
 		addr = ":https"
 	}
 
+	p := s.protocols()
+	if p.http3() {
+		fn, ok := s.TLSNextProto["http/3"]
+		if !ok {
+			return errors.New("http: Server.Protocols contains HTTP3, but Server does not support HTTP/3")
+		}
+		config, err := s.setupTLSConfig(certFile, keyFile, []string{"h3"})
+		if err != nil {
+			return err
+		}
+		errc := make(chan error, 1)
+		s.mu.Lock()
+		s.h3 = &http3ServerHandler{
+			handler:   serverHandler{s},
+			tlsConfig: config,
+			baseCtx:   context.WithValue(context.Background(), ServerContextKey, s),
+			errc:      errc,
+		}
+		s.mu.Unlock()
+		go fn(s, nil, s.h3)
+		if err := <-errc; err != nil {
+			return err
+		}
+	}
+
+	// Only start a TCP listener if HTTP/1 or HTTP/2 is used.
+	if !p.HTTP1() && !p.HTTP2() && !p.UnencryptedHTTP2() {
+		return nil
+	}
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
-
 	defer ln.Close()
-
-	return srv.ServeTLS(ln, certFile, keyFile)
+	return s.ServeTLS(ln, certFile, keyFile)
 }
 
 // setupHTTP2_ServeTLS conditionally configures HTTP/2 on
-// srv and reports whether there was an error setting it up. If it is
+// s and reports whether there was an error setting it up. If it is
 // not configured for policy reasons, nil is returned.
-func (srv *Server) setupHTTP2_ServeTLS() error {
-	srv.nextProtoOnce.Do(srv.onceSetNextProtoDefaults)
-	return srv.nextProtoErr
+func (s *Server) setupHTTP2_ServeTLS() error {
+	s.nextProtoOnce.Do(s.onceSetNextProtoDefaults)
+	return s.nextProtoErr
 }
 
 // setupHTTP2_Serve is called from (*Server).Serve and conditionally
-// configures HTTP/2 on srv using a more conservative policy than
+// configures HTTP/2 on s using a more conservative policy than
 // setupHTTP2_ServeTLS because Serve is called after tls.Listen,
 // and may be called concurrently. See shouldConfigureHTTP2ForServe.
 //
 // The tests named TestTransportAutomaticHTTP2* and
 // TestConcurrentServerServe in server_test.go demonstrate some
 // of the supported use cases and motivations.
-func (srv *Server) setupHTTP2_Serve() error {
-	srv.nextProtoOnce.Do(srv.onceSetNextProtoDefaults_Serve)
-	return srv.nextProtoErr
+func (s *Server) setupHTTP2_Serve() error {
+	s.nextProtoOnce.Do(s.onceSetNextProtoDefaults_Serve)
+	return s.nextProtoErr
 }
 
-func (srv *Server) onceSetNextProtoDefaults_Serve() {
-	if srv.shouldConfigureHTTP2ForServe() {
-		srv.onceSetNextProtoDefaults()
+func (s *Server) onceSetNextProtoDefaults_Serve() {
+	if s.shouldConfigureHTTP2ForServe() {
+		s.onceSetNextProtoDefaults()
 	}
 }
 
 var http2server = godebug.New("http2server")
 
 // onceSetNextProtoDefaults configures HTTP/2, if the user hasn't
-// configured otherwise. (by setting srv.TLSNextProto non-nil)
-// It must only be called via srv.nextProtoOnce (use srv.setupHTTP2_*).
-func (srv *Server) onceSetNextProtoDefaults() {
+// configured otherwise. (by setting s.TLSNextProto non-nil)
+// It must only be called via s.nextProtoOnce (use s.setupHTTP2_*).
+func (s *Server) onceSetNextProtoDefaults() {
 	if omitBundledHTTP2 {
+		return
+	}
+	p := s.protocols()
+	if !p.HTTP2() && !p.UnencryptedHTTP2() {
 		return
 	}
 	if http2server.Value() == "0" {
 		http2server.IncNonDefault()
 		return
 	}
-	// Enable HTTP/2 by default if the user hasn't otherwise
-	// configured their TLSNextProto map.
-	if srv.TLSNextProto == nil {
-		conf := &http2Server{}
-		srv.nextProtoErr = http2ConfigureServer(srv, conf)
+	if _, ok := s.TLSNextProto["h2"]; ok {
+		// TLSNextProto already contains an HTTP/2 implementation.
+		// The user probably called golang.org/x/net/http2.ConfigureServer
+		// to add it.
+		return
 	}
+	s.configureHTTP2()
 }
 
 // TimeoutHandler returns a [Handler] that runs h with the given time limit.
@@ -3677,9 +3993,7 @@ func (h *timeoutHandler) ServeHTTP(w ResponseWriter, r *Request) {
 		tw.mu.Lock()
 		defer tw.mu.Unlock()
 		dst := w.Header()
-		for k, vv := range tw.h {
-			dst[k] = vv
-		}
+		maps.Copy(dst, tw.h)
 		if !tw.wroteHeader {
 			tw.code = StatusOK
 		}

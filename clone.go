@@ -11,7 +11,7 @@ import (
 	_ "unsafe" // for linkname
 )
 
-// cloneURLValues should be an github.com/wangluozhe/chttp/internal detail,
+// cloneURLValues should be an internal detail,
 // but widely used packages access it using linkname.
 // Notable members of the hall of shame include:
 //   - github.com/searKing/golang
@@ -29,7 +29,7 @@ func cloneURLValues(v url.Values) url.Values {
 	return url.Values(Header(v).Clone())
 }
 
-// cloneURL should be an github.com/wangluozhe/chttp/internal detail,
+// cloneURL should be an internal detail,
 // but widely used packages access it using linkname.
 // Notable members of the hall of shame include:
 //   - github.com/searKing/golang
@@ -51,7 +51,7 @@ func cloneURL(u *url.URL) *url.URL {
 	return u2
 }
 
-// cloneMultipartForm should be an github.com/wangluozhe/chttp/internal detail,
+// cloneMultipartForm should be an internal detail,
 // but widely used packages access it using linkname.
 // Notable members of the hall of shame include:
 //   - github.com/searKing/golang
@@ -68,7 +68,7 @@ func cloneMultipartForm(f *multipart.Form) *multipart.Form {
 		Value: (map[string][]string)(Header(f.Value).Clone()),
 	}
 	if f.File != nil {
-		m := make(map[string][]*multipart.FileHeader)
+		m := make(map[string][]*multipart.FileHeader, len(f.File))
 		for k, vv := range f.File {
 			vv2 := make([]*multipart.FileHeader, len(vv))
 			for i, v := range vv {
@@ -81,7 +81,7 @@ func cloneMultipartForm(f *multipart.Form) *multipart.Form {
 	return f2
 }
 
-// cloneMultipartFileHeader should be an github.com/wangluozhe/chttp/internal detail,
+// cloneMultipartFileHeader should be an internal detail,
 // but widely used packages access it using linkname.
 // Notable members of the hall of shame include:
 //   - github.com/searKing/golang
@@ -103,7 +103,7 @@ func cloneMultipartFileHeader(fh *multipart.FileHeader) *multipart.FileHeader {
 // cloneOrMakeHeader invokes Header.Clone but if the
 // result is nil, it'll instead make and return a non-nil Header.
 //
-// cloneOrMakeHeader should be an github.com/wangluozhe/chttp/internal detail,
+// cloneOrMakeHeader should be an internal detail,
 // but widely used packages access it using linkname.
 // Notable members of the hall of shame include:
 //   - github.com/searKing/golang

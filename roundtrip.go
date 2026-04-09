@@ -16,7 +16,7 @@ import _ "unsafe" // for linkname
 // Do not remove or change the type signature.
 // See go.dev/issue/67401.
 //
-//go:linkname badRoundTrip github.com/wangluozhe/chttp.(*Transport).RoundTrip
+//go:linkname badRoundTrip net/http.(*Transport).RoundTrip
 func badRoundTrip(*Transport, *Request) (*Response, error)
 
 // RoundTrip implements the [RoundTripper] interface.
@@ -27,5 +27,8 @@ func badRoundTrip(*Transport, *Request) (*Response, error)
 // Like the RoundTripper interface, the error types returned
 // by RoundTrip are unspecified.
 func (t *Transport) RoundTrip(req *Request) (*Response, error) {
+	if t == nil {
+		panic("transport is nil")
+	}
 	return t.roundTrip(req)
 }
