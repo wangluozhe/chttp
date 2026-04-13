@@ -49,12 +49,13 @@ package godebug
 // meaning it cannot introduce a GODEBUG setting of its own.
 // We keep imports to the absolute bare minimum.
 import (
-	"github.com/wangluozhe/chttp/internal/bisect"
-	"github.com/wangluozhe/chttp/internal/godebugs"
 	"sync"
 	"sync/atomic"
 	"unsafe"
 	_ "unsafe" // go:linkname
+
+	"github.com/wangluozhe/chttp/internal/bisect"
+	"github.com/wangluozhe/chttp/internal/godebugs"
 )
 
 // A Setting is a single setting in the $GODEBUG environment variable.
@@ -127,7 +128,7 @@ func (s *Setting) register() {
 	if s.info == nil || s.info.Opaque {
 		panic("godebug: unexpected IncNonDefault of " + s.name)
 	}
-	//registerMetric("/godebug/non-default-behavior/"+s.Name()+":events", s.nonDefault.Load)
+	registerMetric("/godebug/non-default-behavior/"+s.Name()+":events", s.nonDefault.Load)
 }
 
 // cache is a cache of all the GODEBUG settings,
@@ -184,40 +185,22 @@ func lookup(name string) *setting {
 	return s
 }
 
-// setUpdate is provided by package runtime.
-// It calls update(def, env), where def is the default GODEBUG setting
-// and env is the current value of the $GODEBUG environment variable.
-// After that first call, the runtime calls update(def, env)
-// again each time the environment variable changes
-// (due to use of os.Setenv, for example).
-//
-////go:linkname setUpdate
-//func setUpdate(update func(string, string))
+// setUpdate is provided by package runtime in standard library.
+// For chttp we just provide a stub.
+func setUpdate(update func(string, string)) {}
 
-// registerMetric is provided by package runtime.
-// It forwards registrations to runtime/metrics.
-//
-////go:linkname registerMetric
-//func registerMetric(name string, read func() uint64)
+// registerMetric is provided by package runtime in standard library.
+// For chttp we just provide a stub.
+func registerMetric(name string, read func() uint64) {}
 
-// setNewIncNonDefault is provided by package runtime.
-// The runtime can do
-//
-//	inc := newNonDefaultInc(name)
-//
-// instead of
-//
-//	inc := godebug.New(name).IncNonDefault
-//
-// since it cannot import godebug.
-//
-////go:linkname setNewIncNonDefault
-//func setNewIncNonDefault(newIncNonDefault func(string) func())
+// setNewIncNonDefault is provided by package runtime in standard library.
+// For chttp we just provide a stub.
+func setNewIncNonDefault(newIncNonDefault func(string) func()) {}
 
-//func init() {
-//	setUpdate(update)
-//	setNewIncNonDefault(newIncNonDefault)
-//}
+func init() {
+	setUpdate(update)
+	setNewIncNonDefault(newIncNonDefault)
+}
 
 func newIncNonDefault(name string) func() {
 	s := New(name)
@@ -237,8 +220,14 @@ func update(def, env string) {
 	// Update all the cached values, creating new ones as needed.
 	// We parse the environment variable first, so that any settings it has
 	// are already locked in place (did[name] = true) before we consider
-	// the defaults.
+	// the defaults. Existing immutable settings are always locked.
 	did := make(map[string]bool)
+	cache.Range(func(name, s any) bool {
+		if info := s.(*setting).info; info != nil && info.Immutable {
+			did[name.(string)] = true
+		}
+		return true
+	})
 	parse(did, env)
 	parse(did, def)
 
