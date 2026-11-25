@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -30,19 +31,21 @@ func TestTransportWire(t *testing.T) {
 	cert, roots := wireCredentials(t)
 	var fixedHello []byte
 	for _, test := range []struct {
-		name        string
-		useTLS, h2  bool
-		custom      bool
-		requestBody bool
-		replay      bool
-		forceHTTP1  bool
-		onlyALPN    string
+		name         string
+		useTLS, h2   bool
+		custom       bool
+		requestBody  bool
+		replay       bool
+		legacyReplay bool
+		forceHTTP1   bool
+		onlyALPN     string
 	}{
 		{name: "HTTP1"},
 		{name: "DefaultHTTP2", useTLS: true, h2: true},
 		{name: "FixedJA3", useTLS: true, h2: true, custom: true},
 		{name: "RandomJA3", useTLS: true, h2: true, custom: true},
 		{name: "Replay", useTLS: true, h2: true, custom: true, replay: true},
+		{name: "LegacyReplay", useTLS: true, h2: true, custom: true, replay: true, legacyReplay: true},
 		{name: "ForceHTTP1", useTLS: true, custom: true, forceHTTP1: true},
 		{name: "PriorityStreamID", useTLS: true, h2: true, custom: true},
 		{name: "HTTP1Body", requestBody: true},
@@ -88,7 +91,12 @@ func TestTransportWire(t *testing.T) {
 					configureBenchmarkJA3(t, fixed)
 					fixedHello = captureTransportWire(t, cert, fixed, true, true, false, false).rawHello
 				}
-				transport.TLSExtensions.ClientHelloHexStream = hex.EncodeToString(fixedHello)
+				transport.ClientHelloHexStream = hex.EncodeToString(fixedHello)
+				if test.legacyReplay {
+					transport.TLSExtensions.ClientHelloHexStream = transport.ClientHelloHexStream
+					transport.ClientHelloHexStream = "invalid hex"
+				}
+				transport.ClientHelloID = &utls.HelloFirefox_148
 			}
 			got := captureTransportWire(t, cert, transport, useTLS, h2, test.name != "DefaultHTTP2", test.requestBody)
 			if useTLS {
@@ -144,6 +152,64 @@ func TestTransportWire(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTransportClientHelloPreset(t *testing.T) {
+	cert, roots := wireCredentials(t)
+	for _, test := range []struct {
+		name        string
+		preset      *utls.ClientHelloID
+		alpn        string
+		forceHTTP1  bool
+		trustAnchor bool
+		hybridShare bool
+	}{
+		{name: "Chrome133", preset: &utls.HelloChrome_133, alpn: "h2,http/1.1", hybridShare: true},
+		{name: "Chrome155", preset: &utls.HelloChrome_155, alpn: "h2,http/1.1", trustAnchor: true, hybridShare: true},
+		{name: "Firefox120", preset: &utls.HelloFirefox_120, alpn: "h2,http/1.1"},
+		{name: "Firefox148", preset: &utls.HelloFirefox_148, alpn: "h2,http/1.1", hybridShare: true},
+		{name: "ImplicitHTTP1", preset: &utls.HelloChrome_155, alpn: "http/1.1", trustAnchor: true, hybridShare: true},
+		{name: "ForceHTTP1", preset: &utls.HelloFirefox_148, alpn: "http/1.1", forceHTTP1: true, hybridShare: true},
+		{name: "HTTP2Only", preset: &utls.HelloChrome_155, alpn: "h2", trustAnchor: true, hybridShare: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			transport := &Transport{
+				TLSClientConfig:   &utls.Config{RootCAs: roots, ServerName: "example.com"},
+				ClientHelloID:     test.preset,
+				ForceAttemptHTTP2: test.alpn == "h2,http/1.1" || test.forceHTTP1,
+				ForceHTTP1:        test.forceHTTP1,
+			}
+			if test.alpn == "h2" {
+				transport.Protocols = new(Protocols)
+				transport.Protocols.SetHTTP2(true)
+				transport.JA3 = "invalid JA3"
+			}
+			clone := transport.Clone()
+			if id := clone.ClientHelloID; id == nil || id == test.preset || *id != *test.preset {
+				t.Fatalf("Clone().ClientHelloID = %+v, want a copy of %s", id, test.preset.Str())
+			}
+			h2 := test.alpn != "http/1.1"
+			got := captureTransportWire(t, cert, clone, true, h2, false, false)
+			hello := parseWireClientHello(t, got.rawHello)
+			if hello.ALPN != test.alpn || hello.ServerName != "example.com" {
+				t.Fatalf("ClientHello ALPN/SNI = %q/%q, want %q/example.com", hello.ALPN, hello.ServerName, test.alpn)
+			}
+			if slices.Contains(hello.Extensions, 0xca34) != test.trustAnchor {
+				t.Fatalf("ClientHello extensions = %x, want trust anchors present = %t", hello.Extensions, test.trustAnchor)
+			}
+			if slices.Contains(hello.KeyShares, uint16(utls.X25519MLKEM768)) != test.hybridShare {
+				t.Fatalf("ClientHello key shares = %v, want X25519MLKEM768 present = %t", hello.KeyShares, test.hybridShare)
+			}
+		})
+	}
+
+	t.Run("UnknownPreset", func(t *testing.T) {
+		transport := &Transport{ClientHelloID: &utls.ClientHelloID{Client: "unknown"}}
+		_, err := transport.tlsClient(nil, &utls.Config{}, false)
+		if !errors.Is(err, utls.ErrUnknownClientHelloID) {
+			t.Fatalf("tlsClient error = %v, want %v", err, utls.ErrUnknownClientHelloID)
+		}
+	})
 }
 
 func wireCredentials(t *testing.T) (tls.Certificate, *x509.CertPool) {

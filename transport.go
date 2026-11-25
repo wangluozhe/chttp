@@ -319,12 +319,16 @@ type Transport struct {
 	UserAgent     string
 	TLSExtensions *TLSExtensions
 
-	// ForceHTTP1 restricts the transport to HTTP/1, including with a custom ClientHello.
-	ForceHTTP1 bool
-
 	// ClientHelloHexStream is a captured ClientHello in hex. A capture in
 	// TLSExtensions.ClientHelloHexStream takes precedence.
 	ClientHelloHexStream string
+
+	// ClientHelloID selects a uTLS browser preset for transport-managed TLS
+	// handshakes. It takes precedence over JA3 when no capture is configured.
+	ClientHelloID *tls.ClientHelloID
+
+	// ForceHTTP1 restricts the transport to HTTP/1, including with a custom ClientHello.
+	ForceHTTP1 bool
 }
 
 func (t *Transport) writeBufferSize() int {
@@ -379,6 +383,18 @@ func (t *Transport) Clone() *Transport {
 		ForceHTTP1:             t.ForceHTTP1,
 		ClientHelloHexStream:   t.ClientHelloHexStream,
 		H3Transport:            t.H3Transport,
+	}
+	if t.ClientHelloID != nil {
+		id := *t.ClientHelloID
+		if id.Seed != nil {
+			seed := *id.Seed
+			id.Seed = &seed
+		}
+		if id.Weights != nil {
+			weights := *id.Weights
+			id.Weights = &weights
+		}
+		t2.ClientHelloID = &id
 	}
 	if t.TLSExtensions != nil {
 		t2.TLSExtensions, _ = t.TLSExtensions.Clone()

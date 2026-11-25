@@ -2,7 +2,7 @@
 
 chttp 是 Go [`net/http`](https://pkg.go.dev/net/http) 的分支，提供熟悉的 HTTP 客户端和服务端 API。客户端可以指定请求头顺序、HTTP/1.1 头名大小写、TLS ClientHello，以及 HTTP/2 的伪头顺序和建连帧。适用于需要控制报文格式、验证协议兼容性或比较客户端行为的 Go 项目。
 
-[安装](#安装) · [快速开始](#快速开始) · [请求头](#请求头) · [TLS 和 JA3](#tls-和-ja3) · [HTTP/2](#http2) · [性能对比](#性能对比) · [调试与测试](#调试与测试) · [升级与迁移](#升级与迁移)
+[安装](#安装) · [快速开始](#快速开始) · [请求头](#请求头) · [TLS 和 JA3](#tls-和-ja3) · [HTTP/2](#http2) · [性能对比](#性能对比) · [调试与测试](#调试与测试) · [升级与迁移](#升级与迁移) · [许可证与上游来源](#许可证与上游来源)
 
 ## 安装
 
@@ -95,12 +95,21 @@ HTTP/1.1 的请求行和由传输层单独写入的 `Connection`、`Trailer` 有
 | 配置 | 作用 |
 | --- | --- |
 | `Transport.JA3` | 接收五段逗号分隔的 JA3 字符串，依次描述版本、密码套件、扩展编号、支持组和 EC 点格式。各段内的多项用 `-` 分隔。TLS 版本协商还取决于 `SupportedVersions` 和对端。 |
-| `Transport.TLSExtensions` | 指定签名算法、支持版本、Key Share、证书压缩等扩展内容。启用对应扩展后才会用到这些参数。 |
+| `Transport.TLSExtensions` | 在 JA3 模式下指定签名算法、支持版本、Key Share、证书压缩等扩展内容。启用对应扩展后才会用到这些参数。 |
+| `Transport.ClientHelloID` | 选择 uTLS 内置的浏览器版本预设，由预设生成 TLS ClientHello。 |
 | `Transport.RandomJA3` | 在创建新 TLS 连接时打乱可重排的扩展。固定配置的回归测试可保留默认值 `false`。 |
 | `Transport.UserAgent` | 参与 JA3 模式下的 ClientHello 配置选择。HTTP 请求头里的 `User-Agent` 通过 `req.Header.Set` 设置。 |
 | `Transport.ClientHelloHexStream` | 接收一条 TLS ClientHello 记录的十六进制字符串。uTLS 根据解析结果构造新的握手，SNI 和临时密钥取自当前连接。 |
 
-ClientHello 的来源依次为 `TLSExtensions.ClientHelloHexStream`、`Transport.ClientHelloHexStream`、`Transport.JA3` 和默认握手，使用第一个有效配置项。JA3 和重放路径的 ALPN 会遵从明确设置的 `Transport.Protocols` 或 `ForceHTTP1`。使用 JA3 配置协商 HTTP/2 时，JA3 需要包含 ALPN 扩展 `16`。[tlsextensions.go](tlsextensions.go)
+ClientHello 的配置优先级依次为 `Transport.ClientHelloHexStream`、`Transport.ClientHelloID`、`Transport.JA3` 和默认握手。旧字段 `TLSExtensions.ClientHelloHexStream` 已弃用，非空时具有最高优先级。浏览器预设的 ALPN 遵从传输层启用的 HTTP 协议和 `ForceHTTP1`。JA3 和重放路径的 ALPN 遵从明确设置的 `Transport.Protocols` 或 `ForceHTTP1`。使用 JA3 配置协商 HTTP/2 时，JA3 需要包含 ALPN 扩展 `16`。[tlsextensions.go](tlsextensions.go)
+
+以 Firefox 148 为例，从 `github.com/refraction-networking/utls` 导入 `utls`。将 `ClientHelloID` 设为 `&utls.HelloChrome_155` 即可切换到 Chrome 155。可选版本由当前依赖的 uTLS 提供。[uTLS 浏览器预设](vendor/github.com/refraction-networking/utls/u_common.go)
+
+```go
+transport := chttp.DefaultTransport.(*chttp.Transport).Clone()
+transport.ClientHelloID = &utls.HelloFirefox_148
+client := &chttp.Client{Transport: transport}
+```
 
 HTTPS 握手由 `Transport` 管理时，这些配置在建连阶段生效。普通 TCP 拨号定制放在 `DialContext`。使用 `DialTLSContext` 接管直连 HTTPS 时，由回调负责 TLS 配置和握手。一个正在复用的连接沿用自身的握手结果。[transport.go](transport.go)
 
@@ -246,9 +255,14 @@ go test -mod=vendor -run '^TestTransportWire$' -count=1 -v .
 | 在 `HTTP2Transport` 设置 `TLSClientConfig`、`DialTLS` 或 `DialTLSContext` | 在父 `Transport` 配置 TLS 或拨号，按父 transport 的回调签名调整。 |
 | 设置 `HTTP2Transport.ConnPool` | 由父 `Transport` 的连接池管理 HTTP/1.1 与 HTTP/2 连接，通过 `MaxConnsPerHost` 等字段控制连接数。 |
 | 调用 `Transport.CancelRequest` | 使用 `NewRequestWithContext` 或 `Request.WithContext` 传递可取消的 context。旧方法随上游成为空操作。 |
+| 设置 `TLSExtensions.ClientHelloHexStream` | 改用 `Transport.ClientHelloHexStream`。 |
 
 HTTP/3 的旧注册钩子保留给外部实现。内置客户端和服务端的文档及基准覆盖 HTTP/1.1 与 HTTP/2。[http3.go](http3.go) · [transport.go](transport.go)
 
-## 上游来源
+## 许可证与上游来源
 
-`net/http` 派生文件保留 Go Authors 的版权声明，并指向 Go 项目的 BSD-style 许可证。当前仓库根目录缺少项目许可证文件。[Go LICENSE](https://github.com/golang/go/blob/568727209742/LICENSE)
+chttp 新增代码的版权归各贡献者所有，按 BSD 3-Clause 条款发布。带有 Go Authors 版权声明的标准库派生文件保留原有声明，根目录 `LICENSE` 收录当前 Go 基线的 BSD 3-Clause 许可原文。[LICENSE](LICENSE) · [Go 上游许可证](https://github.com/golang/go/blob/568727209742/LICENSE)
+
+`internal/profile/graph.go` 从 Go 标准库引入，源于 `google/pprof`，沿用 Apache License 2.0 并保留原有版权声明。[graph.go](internal/profile/graph.go) · [Apache 2.0 全文](internal/profile/LICENSE)
+
+`vendor/` 中的依赖沿用各自的许可证。再分发时应随附适用的许可文本和版权声明。[vendor/](vendor/)

@@ -29,7 +29,9 @@ type TLSExtensions struct {
 	KeyShareCurves               *utls.KeyShareExtension
 	TrustAnchors                 *utls.TrustAnchorsExtension
 	NotUsedGREASE                bool
-	ClientHelloHexStream         string
+
+	// Deprecated: Use [Transport.ClientHelloHexStream] instead.
+	ClientHelloHexStream string
 }
 
 type errExtensionNotExist struct {
@@ -66,10 +68,10 @@ func (t *Transport) tlsClient(conn net.Conn, cfg *utls.Config, onlyH1 bool) (*ut
 	protocols := t.Protocols
 	restrictALPN := protocols != nil && !(protocols.HTTP1() && protocols.HTTP2())
 	hello := t.ClientHelloHexStream
-	if t.TLSExtensions != nil && t.TLSExtensions.ClientHelloHexStream != "" {
-		hello = t.TLSExtensions.ClientHelloHexStream
+	if extensions := t.TLSExtensions; extensions != nil && extensions.ClientHelloHexStream != "" {
+		hello = extensions.ClientHelloHexStream
 	}
-	if hello == "" && t.JA3 == "" {
+	if hello == "" && t.ClientHelloID == nil && t.JA3 == "" {
 		switch {
 		case t.ForceHTTP1:
 			cfg.NextProtos = []string{"http/1.1"}
@@ -82,8 +84,8 @@ func (t *Transport) tlsClient(conn net.Conn, cfg *utls.Config, onlyH1 bool) (*ut
 	}
 
 	var spec *utls.ClientHelloSpec
-	var err error
-	if hello != "" {
+	switch {
+	case hello != "":
 		raw, err := hex.DecodeString(hello)
 		if err != nil {
 			return nil, fmt.Errorf("http: decoding ClientHello: %w", err)
@@ -99,7 +101,17 @@ func (t *Transport) tlsClient(conn net.Conn, cfg *utls.Config, onlyH1 bool) (*ut
 		}) {
 			cfg.SessionTicketsDisabled = true
 		}
-	} else {
+	case t.ClientHelloID != nil:
+		preset, err := utls.UTLSIdToSpec(*t.ClientHelloID)
+		if err != nil {
+			return nil, fmt.Errorf("http: selecting TLS ClientHello preset: %w", err)
+		}
+		spec = &preset
+		cfg.PreferSkipResumptionOnNilExtension = true
+		enabled := t.protocols()
+		protocols = &enabled
+		restrictALPN = !(enabled.HTTP1() && enabled.HTTP2())
+	default:
 		var extensions TLSExtensions
 		if t.TLSExtensions != nil {
 			extensions = *t.TLSExtensions
@@ -116,6 +128,7 @@ func (t *Transport) tlsClient(conn net.Conn, cfg *utls.Config, onlyH1 bool) (*ut
 			extensions.KeyShareCurves = &utls.KeyShareExtension{KeyShares: keys}
 		}
 		// ApplyPreset deep-clones the spec. The other extension fields can be read directly.
+		var err error
 		spec, err = extensions.StringToSpec(t.JA3, t.UserAgent, false, t.RandomJA3)
 		if err != nil {
 			return nil, err
