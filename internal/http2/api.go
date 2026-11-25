@@ -6,13 +6,12 @@ package http2
 
 import (
 	"context"
-	"errors"
 	tls "github.com/refraction-networking/utls"
-	"github.com/wangluozhe/chttp/internal"
+	"errors"
 	"io"
 	"log"
-	"mime/multipart"
 	"net"
+	"github.com/wangluozhe/chttp/internal"
 	"net/textproto"
 	"net/url"
 	"time"
@@ -47,7 +46,6 @@ type ClientRequest struct {
 	Trailer       Header
 	Body          io.ReadCloser
 	Host          string
-	GetBody       func() (io.ReadCloser, error)
 	ContentLength int64
 	Cancel        <-chan struct{}
 	Close         bool
@@ -55,27 +53,6 @@ type ClientRequest struct {
 
 	// Include the per-request stream in the ClientRequest to avoid an allocation.
 	stream clientStream
-}
-
-// Clone makes a shallow copy of ClientRequest.
-//
-// Clone is only used in shouldRetryRequest.
-// We can drop it if we ever get rid of or rework that function.
-func (req *ClientRequest) Clone() *ClientRequest {
-	return &ClientRequest{
-		Context:       req.Context,
-		Method:        req.Method,
-		URL:           req.URL,
-		Header:        req.Header,
-		Trailer:       req.Trailer,
-		Body:          req.Body,
-		Host:          req.Host,
-		GetBody:       req.GetBody,
-		ContentLength: req.ContentLength,
-		Cancel:        req.Cancel,
-		Close:         req.Close,
-		ResTrailer:    req.ResTrailer,
-	}
 }
 
 // A ClientResponse is a Request used by the HTTP/2 client (Transport).
@@ -94,18 +71,18 @@ type Header = textproto.MIMEHeader
 
 // TransportConfig is configuration from an http.Transport.
 type TransportConfig interface {
+	MaxHeaderListSize() int64
 	MaxResponseHeaderBytes() int64
 	DisableCompression() bool
-	DisableKeepAlives() bool
 	ExpectContinueTimeout() time.Duration
 	ResponseHeaderTimeout() time.Duration
-	IdleConnTimeout() time.Duration
 	HTTP2Config() Config
 }
 
 // ServerConfig is configuration from an http.Server.
 type ServerConfig interface {
 	MaxHeaderBytes() int
+	MaxHeaderValueCount() int
 	ConnState(net.Conn, ConnState)
 	DoKeepAlives() bool
 	WriteTimeout() time.Duration
@@ -114,10 +91,7 @@ type ServerConfig interface {
 	ReadTimeout() time.Duration
 	HTTP2Config() Config
 	DisableClientPriority() bool
-}
-
-type Handler interface {
-	ServeHTTP(*ResponseWriter, *ServerRequest)
+	IdleTimeout() time.Duration
 }
 
 type ResponseWriter = responseWriter
@@ -143,7 +117,6 @@ type ServerRequest struct {
 	RemoteAddr    string
 	RequestURI    string
 	TLS           *tls.ConnectionState
-	MultipartForm *multipart.Form
 }
 
 // ConnState is identical to net/http.ConnState.

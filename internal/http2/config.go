@@ -22,50 +22,20 @@ type Config struct {
 	PingTimeout                   time.Duration
 	WriteByteTimeout              time.Duration
 	PermitProhibitedCipherSuites  bool
+	EnableConnectProtocol         bool
 	CountError                    func(errType string)
 }
 
-func configFromServer(h1 ServerConfig, h2 *Server) Config {
-	conf := Config{
-		MaxConcurrentStreams:          int(h2.MaxConcurrentStreams),
-		MaxEncoderHeaderTableSize:     int(h2.MaxEncoderHeaderTableSize),
-		MaxDecoderHeaderTableSize:     int(h2.MaxDecoderHeaderTableSize),
-		MaxReadFrameSize:              int(h2.MaxReadFrameSize),
-		MaxReceiveBufferPerConnection: int(h2.MaxUploadBufferPerConnection),
-		MaxReceiveBufferPerStream:     int(h2.MaxUploadBufferPerStream),
-		SendPingTimeout:               h2.ReadIdleTimeout,
-		PingTimeout:                   h2.PingTimeout,
-		WriteByteTimeout:              h2.WriteByteTimeout,
-		PermitProhibitedCipherSuites:  h2.PermitProhibitedCipherSuites,
-		CountError:                    h2.CountError,
-	}
+func configFromServer(h1 ServerConfig) Config {
+	conf := Config{}
 	fillNetHTTPConfig(&conf, h1.HTTP2Config())
 	setConfigDefaults(&conf, true)
 	return conf
 }
 
 func configFromTransport(h2 *Transport) Config {
-	conf := Config{
-		MaxEncoderHeaderTableSize: int(h2.MaxEncoderHeaderTableSize),
-		MaxDecoderHeaderTableSize: int(h2.MaxDecoderHeaderTableSize),
-		MaxReadFrameSize:          int(h2.MaxReadFrameSize),
-		SendPingTimeout:           h2.ReadIdleTimeout,
-		PingTimeout:               h2.PingTimeout,
-		WriteByteTimeout:          h2.WriteByteTimeout,
-	}
-
-	// Unlike most config fields, where out-of-range values revert to the default,
-	// Transport.MaxReadFrameSize clips.
-	if conf.MaxReadFrameSize < minMaxFrameSize {
-		conf.MaxReadFrameSize = minMaxFrameSize
-	} else if conf.MaxReadFrameSize > maxFrameSize {
-		conf.MaxReadFrameSize = maxFrameSize
-	}
-
-	if h2.t1 != nil {
-		fillNetHTTPConfig(&conf, h2.t1.HTTP2Config())
-	}
-
+	conf := Config{}
+	fillNetHTTPConfig(&conf, h2.t1.HTTP2Config())
 	setConfigDefaults(&conf, false)
 	return conf
 }
@@ -140,6 +110,9 @@ func fillNetHTTPConfig(conf *Config, h2 Config) {
 	}
 	if h2.PermitProhibitedCipherSuites {
 		conf.PermitProhibitedCipherSuites = true
+	}
+	if h2.EnableConnectProtocol {
+		conf.EnableConnectProtocol = true
 	}
 	if h2.CountError != nil {
 		conf.CountError = h2.CountError

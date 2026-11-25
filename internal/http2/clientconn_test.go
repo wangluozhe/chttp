@@ -15,21 +15,22 @@ import (
 	"github.com/wangluozhe/chttp"
 	"github.com/wangluozhe/chttp/internal/gate"
 	. "github.com/wangluozhe/chttp/internal/http2"
+	"github.com/wangluozhe/chttp/internal/nettest"
 	"io"
 	"net"
+	"os"
 	"reflect"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
-	"time"
 	_ "unsafe" // for go:linkname
 
 	"golang.org/x/net/http2/hpack"
 )
 
 // TestTestClientConn demonstrates usage of testClientConn.
-func TestTestClientConn(t *testing.T) { synctestTest(t, testTestClientConn) }
-func testTestClientConn(t testing.TB) {
+func TestTestClientConn(t *testing.T) { synctest.Test(t, testTestClientConn) }
+func testTestClientConn(t *testing.T) {
 	// newTestClientConn creates a *ClientConn and surrounding test infrastructure.
 	tc := newTestClientConn(t)
 
@@ -96,7 +97,7 @@ func testTestClientConn(t testing.TB) {
 // testClientConn manages synchronization, so tests can generally be written as
 // a linear sequence of actions and validations without additional synchronization.
 type testClientConn struct {
-	t testing.TB
+	t *testing.T
 
 	tr *Transport
 	fr *Framer
@@ -108,10 +109,10 @@ type testClientConn struct {
 
 	roundtrips []*testRoundTrip
 
-	netconn *synctestNetConn
+	netconn *nettest.Conn
 }
 
-func newTestClientConnFromClientConn(t testing.TB, tr *Transport, cc *ClientConn) *testClientConn {
+func newTestClientConnFromClientConn(t *testing.T, tr *Transport, cc *ClientConn) *testClientConn {
 	tc := &testClientConn{
 		t:  t,
 		tr: tr,
@@ -121,17 +122,18 @@ func newTestClientConnFromClientConn(t testing.TB, tr *Transport, cc *ClientConn
 	// cli is the conn used by the client under test, srv is the side controlled by the test.
 	// We replace the conn being used by the client (possibly a *tls.Conn) with a new one,
 	// to avoid dealing with encryption in tests.
-	cli, srv := synctestNetPipe()
+	cli, srv := nettest.NewConnPair()
 	cc.TestSetNetConn(cli)
 
-	srv.SetReadDeadline(time.Now())
+	srv.SetReadError(os.ErrDeadlineExceeded) // make conn non-blocking
 	tc.netconn = srv
 	tc.enc = hpack.NewEncoder(&tc.encbuf)
 	tc.fr = NewFramer(srv, srv)
 	tc.testConnFramer = testConnFramer{
-		t:   t,
-		fr:  tc.fr,
-		dec: hpack.NewDecoder(InitialHeaderTableSize, nil),
+		t:        t,
+		fr:       tc.fr,
+		dec:      hpack.NewDecoder(InitialHeaderTableSize, nil),
+		testconn: srv,
 	}
 	tc.fr.SetMaxReadFrameSize(10 << 20)
 	t.Cleanup(func() {
@@ -144,6 +146,7 @@ func newTestClientConnFromClientConn(t testing.TB, tr *Transport, cc *ClientConn
 func (tc *testClientConn) readClientPreface() {
 	tc.t.Helper()
 	// Read the client's HTTP/2 preface, sent prior to any HTTP/2 frames.
+	synctest.Wait()
 	buf := make([]byte, len(ClientPreface))
 	if _, err := io.ReadFull(tc.netconn, buf); err != nil {
 		tc.t.Fatalf("reading preface: %v", err)
@@ -153,13 +156,12 @@ func (tc *testClientConn) readClientPreface() {
 	}
 }
 
-func newTestClientConn(t testing.TB, opts ...any) *testClientConn {
+func newTestClientConn(t *testing.T, opts ...any) *testClientConn {
 	t.Helper()
 
 	tt := newTestTransport(t, opts...)
-	const singleUse = false
 	tr := transportFromH1Transport(tt.tr1).(*Transport)
-	_, err := tr.TestNewClientConn(nil, singleUse, nil)
+	_, err := tr.TestNewClientConn(nil, nil)
 	if err != nil {
 		t.Fatalf("newClientConn: %v", err)
 	}
@@ -167,29 +169,22 @@ func newTestClientConn(t testing.TB, opts ...any) *testClientConn {
 	return tt.getConn()
 }
 
-// hasFrame reports whether a frame is available to be read.
-func (tc *testClientConn) hasFrame() bool {
-	synctest.Wait()
-	return len(tc.netconn.Peek()) > 0
-}
-
 // isClosed reports whether the peer has closed the connection.
 func (tc *testClientConn) isClosed() bool {
 	synctest.Wait()
-	return tc.netconn.IsClosedByPeer()
+	return tc.netconn.Peer().IsClosed()
 }
 
-// closeWrite causes the net.Conn used by the ClientConn to return a error
+// closeWrite causes the net.Conn used by the ClientConn to return an error
 // from Read calls.
 func (tc *testClientConn) closeWrite() {
 	tc.netconn.Close()
 }
 
-// closeWrite causes the net.Conn used by the ClientConn to return a error
+// closeWriteWithError causes the net.Conn used by the ClientConn to return an error
 // from Write calls.
 func (tc *testClientConn) closeWriteWithError(err error) {
-	tc.netconn.loc.setReadError(io.EOF)
-	tc.netconn.loc.setWriteError(err)
+	tc.netconn.Peer().SetWriteError(err)
 }
 
 // testRequestBody is a Request.Body for use in tests.
@@ -312,7 +307,6 @@ func (tc *testClientConn) roundTrip(req *http.Request) *testRoundTrip {
 			Trailer:       Header(req.Trailer),
 			Body:          req.Body,
 			Host:          req.Host,
-			GetBody:       req.GetBody,
 			ContentLength: req.ContentLength,
 			Cancel:        req.Cancel,
 			Close:         req.Close,
@@ -388,7 +382,7 @@ func (tc *testClientConn) inflowWindow(streamID uint32) int32 {
 
 // testRoundTrip manages a RoundTrip in progress.
 type testRoundTrip struct {
-	t       testing.TB
+	t       *testing.T
 	resp    *http.Response
 	respErr error
 	donec   chan struct{}
@@ -519,16 +513,18 @@ func diffHeaders(got, want http.Header) string {
 // Tests that aren't specifically exercising RoundTrip's retry loop or connection pooling
 // should use testClientConn instead.
 type testTransport struct {
-	t   testing.TB
+	t   *testing.T
 	tr1 *http.Transport
 
-	ccs []*testClientConn
+	hasCC chan struct{} // contains a value when len(ccs) > 0
+	ccs   []*testClientConn
 }
 
-func newTestTransport(t testing.TB, opts ...any) *testTransport {
+func newTestTransport(t *testing.T, opts ...any) *testTransport {
 	t.Helper()
 	tt := &testTransport{
-		t: t,
+		t:     t,
+		hasCC: make(chan struct{}, 1),
 	}
 
 	tr1 := &http.Transport{
@@ -540,7 +536,7 @@ func newTestTransport(t testing.TB, opts ...any) *testTransport {
 			// returning a non-*tls.Conn from Transport.DialTLSContext,
 			// in which case we could have a DialTLSContext function that
 			// returns an unencrypted conn.
-			cli, srv := synctestNetPipe()
+			cli, srv := nettest.NewConnPair()
 			go func() {
 				tlsSrv := tls.Server(srv, testServerTLSConfig)
 				if err := tlsSrv.Handshake(); err != nil {
@@ -571,6 +567,9 @@ func newTestTransport(t testing.TB, opts ...any) *testTransport {
 	tr2 := transportFromH1Transport(tr1).(*Transport)
 	tr2.TestSetNewClientConnHook(func(cc *ClientConn) {
 		tc := newTestClientConnFromClientConn(t, tr2, cc)
+		if len(tt.ccs) == 0 {
+			tt.hasCC <- struct{}{}
+		}
 		tt.ccs = append(tt.ccs, tc)
 	})
 
@@ -585,6 +584,7 @@ func newTestTransport(t testing.TB, opts ...any) *testTransport {
 }
 
 func (tt *testTransport) hasConn() bool {
+	synctest.Wait()
 	return len(tt.ccs) > 0
 }
 
@@ -596,6 +596,9 @@ func (tt *testTransport) getConn() *testClientConn {
 	}
 	tc := tt.ccs[0]
 	tt.ccs = tt.ccs[1:]
+	if len(tt.ccs) == 0 {
+		<-tt.hasCC
+	}
 	tc.readClientPreface()
 	synctest.Wait()
 	return tc

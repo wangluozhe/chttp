@@ -4,24 +4,23 @@
 
 // Package http2 implements the HTTP/2 protocol.
 //
-// This package is low-level and intended to be used directly by very
-// few people. Most users will use it indirectly through the automatic
-// use by the net/http package (from Go 1.6 and later).
-// For use in earlier Go versions see ConfigureServer. (Transport support
-// requires Go 1.6 or later)
+// This package is the HTTP/2 implementation used by net/http.
+// It is internal to net/http. Users configure HTTP/2 through
+// net/http.Server and net/http.Transport.
 //
 // See https://http2.github.io/ for more information on HTTP/2.
 package http2
 
 import (
 	"bufio"
+	tls "github.com/refraction-networking/utls"
 	"errors"
 	"fmt"
-	tls "github.com/refraction-networking/utls"
+	"github.com/wangluozhe/chttp/internal/godebug"
 	"net"
 	"os"
 	"slices"
-	"strings"
+	"strconv"
 	"sync"
 	"time"
 
@@ -45,17 +44,21 @@ var (
 	inTests = false
 )
 
+var (
+	http2debug    = godebug.New("#http2debug")
+	http2xconnect = godebug.New("#http2xconnect")
+)
+
 func init() {
-	e := os.Getenv("GODEBUG")
-	if strings.Contains(e, "http2debug=1") {
+	switch http2debug.Value() {
+	case "1":
 		VerboseLogs = true
-	}
-	if strings.Contains(e, "http2debug=2") {
+	case "2":
 		VerboseLogs = true
 		logFrameWrites = true
 		logFrameReads = true
 	}
-	if strings.Contains(e, "http2xconnect=1") {
+	if http2xconnect.Value() == "1" {
 		disableExtendedConnectProtocol = false
 	}
 }
@@ -212,6 +215,17 @@ func validWireHeaderFieldName(v string) bool {
 		}
 	}
 	return true
+}
+
+// TODO: avoid alloc when code is neither 200 nor 404.
+func httpCodeString(code int) string {
+	switch code {
+	case 200:
+		return "200"
+	case 404:
+		return "404"
+	}
+	return strconv.Itoa(code)
 }
 
 // A closeWaiter is like a sync.WaitGroup but only goes 1 to 0 (open to closed).

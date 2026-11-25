@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
-	_ "unsafe"
 
 	"golang.org/x/net/http/httpguts"
 )
@@ -23,7 +22,7 @@ import (
 //   - HTTP1 is the HTTP/1.0 and HTTP/1.1 protocols.
 //     HTTP1 is supported on both unsecured TCP and secured TLS connections.
 //
-//   - HTTP2 is the HTTP/2 protcol over a TLS connection.
+//   - HTTP2 is the HTTP/2 protocol over a TLS connection.
 //
 //   - UnencryptedHTTP2 is the HTTP/2 protocol over an unsecured TCP connection.
 type Protocols struct {
@@ -61,9 +60,6 @@ func (p Protocols) http3() bool { return p.bits&protoHTTP3 != 0 }
 // setHTTP3 adds or removes HTTP/3 from p.
 func (p *Protocols) setHTTP3(ok bool) { p.setBit(protoHTTP3, ok) }
 
-//go:linkname protocolSetHTTP3 golang.org/x/net/internal/http3_test.protocolSetHTTP3
-func protocolSetHTTP3(p *Protocols) { p.setHTTP3(true) }
-
 func (p *Protocols) setBit(bit uint8, ok bool) {
 	if ok {
 		p.bits |= bit
@@ -88,6 +84,9 @@ func (p Protocols) String() string {
 	if p.UnencryptedHTTP2() {
 		s = append(s, "UnencryptedHTTP2")
 	}
+	if p.http3() {
+		s = append(s, "HTTP3")
+	}
 	return "{" + strings.Join(s, ",") + "}"
 }
 
@@ -104,11 +103,6 @@ const maxInt64 = 1<<63 - 1
 // immediate cancellation of network operations.
 var aLongTimeAgo = time.Unix(1, 0)
 
-// omitBundledHTTP2 is set by omithttp2.go when the nethttpomithttp2
-// build tag is set. That means h2_bundle.go isn't compiled in and we
-// shouldn't try to use it.
-var omitBundledHTTP2 bool
-
 // TODO(bradfitz): move common stuff here. The other files have accumulated
 // generic http stuff in random places.
 
@@ -119,19 +113,6 @@ type contextKey struct {
 }
 
 func (k *contextKey) String() string { return "net/http context value " + k.name }
-
-// removePort strips the port while correclty handling IPv6.
-func removePort(host string) string {
-	for i := len(host) - 1; i >= 0; i-- {
-		switch host[i] {
-		case ':':
-			return host[:i]
-		case ']':
-			return host
-		}
-	}
-	return host
-}
 
 // isToken reports whether v is a valid token (https://www.rfc-editor.org/rfc/rfc2616#section-2.2).
 func isToken(v string) bool {
@@ -311,6 +292,15 @@ type HTTP2Config struct {
 	// PermitProhibitedCipherSuites, if true, permits the use of
 	// cipher suites prohibited by the HTTP/2 spec.
 	PermitProhibitedCipherSuites bool
+
+	// EnableConnectProtocol, if true, enables support for
+	// the Extended CONNECT protocol defined in RFC 8441.
+	// When enabled, HTTP/2 servers will advertise support for Extended CONNECT.
+	// Extended CONNECT requests will include a ":protocol" pseudo header
+	// in the request headers.
+	//
+	// This parameter only applies to Servers.
+	EnableConnectProtocol bool
 
 	// CountError, if non-nil, is called on HTTP/2 errors.
 	// It is intended to increment a metric for monitoring.

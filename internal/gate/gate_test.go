@@ -6,7 +6,7 @@ package gate_test
 
 import (
 	"context"
-	"internal/gate"
+	"github.com/wangluozhe/chttp/internal/gate"
 	"testing"
 	"time"
 )

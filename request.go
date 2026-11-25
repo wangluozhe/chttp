@@ -13,8 +13,12 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	tls "github.com/refraction-networking/utls"
+	"github.com/wangluozhe/chttp/httptrace"
+	"github.com/wangluozhe/chttp/internal/ascii"
 	"io"
 	"maps"
+	"math"
 	"mime"
 	"mime/multipart"
 	"net/textproto"
@@ -24,10 +28,6 @@ import (
 	"strings"
 	"sync"
 	_ "unsafe" // for linkname
-
-	tls "github.com/refraction-networking/utls"
-	"github.com/wangluozhe/chttp/httptrace"
-	"github.com/wangluozhe/chttp/internal/ascii"
 
 	"golang.org/x/net/http/httpguts"
 	"golang.org/x/net/idna"
@@ -66,7 +66,7 @@ var (
 	ErrNotSupported = &ProtocolError{"feature not supported"}
 
 	// Deprecated: ErrUnexpectedTrailer is no longer returned by
-	// anything in the github.com/wangluozhe/chttp package. Callers should not
+	// anything in the net/http package. Callers should not
 	// compare errors against this variable.
 	ErrUnexpectedTrailer = &ProtocolError{"trailer header without chunked transfer encoding"}
 
@@ -79,17 +79,17 @@ var (
 	ErrNotMultipart = &ProtocolError{"request Content-Type isn't multipart/form-data"}
 
 	// Deprecated: ErrHeaderTooLong is no longer returned by
-	// anything in the github.com/wangluozhe/chttp package. Callers should not
+	// anything in the net/http package. Callers should not
 	// compare errors against this variable.
 	ErrHeaderTooLong = &ProtocolError{"header too long"}
 
 	// Deprecated: ErrShortBody is no longer returned by
-	// anything in the github.com/wangluozhe/chttp package. Callers should not
+	// anything in the net/http package. Callers should not
 	// compare errors against this variable.
 	ErrShortBody = &ProtocolError{"entity body too short"}
 
 	// Deprecated: ErrMissingContentLength is no longer returned by
-	// anything in the github.com/wangluozhe/chttp package. Callers should not
+	// anything in the net/http package. Callers should not
 	// compare errors against this variable.
 	ErrMissingContentLength = &ProtocolError{"missing ContentLength in HEAD response"}
 )
@@ -98,14 +98,10 @@ func badStringError(what, val string) error { return fmt.Errorf("%s %q", what, v
 
 // Headers that Request.Write handles itself and should be skipped.
 var reqWriteExcludeHeader = map[string]bool{
-	//"Host":              true, // not in Header map anyway
-	//"User-Agent":        true,
-	//"Content-Length":    true,
-	//"Transfer-Encoding": true,
-	//"Trailer":           true,
-	HeaderOrderKey:     true,
-	PHeaderOrderKey:    true,
-	UnChangedHeaderKey: true,
+	"Host":              true, // not in Header map anyway
+	"Content-Length":    true,
+	"Transfer-Encoding": true,
+	"Trailer":           true,
 }
 
 // A Request represents an HTTP request received by a server
@@ -282,6 +278,10 @@ type Request struct {
 	// After the HTTP request is sent the map values can be updated while
 	// the request body is read. Once the body returns EOF, the caller must
 	// not mutate Trailer.
+	//
+	// Writing a request whose Trailer contains a key with invalid bytes
+	// (such as CR or LF), or such a value present when Write begins,
+	// returns an error.
 	//
 	// Few HTTP clients, servers, or proxies support HTTP trailers.
 	Trailer Header
@@ -625,7 +625,7 @@ func (r *Request) write(w io.Writer, usingProxy bool, extraHeaders Header, waitF
 	// Validate that the Host header is a valid header in general,
 	// but don't validate the host itself. This is sufficient to avoid
 	// header or request smuggling via the Host field.
-	// The server can (and will, if it's a github.com/wangluozhe/chttp server) reject
+	// The server can (and will, if it's a net/http server) reject
 	// the request if it doesn't consider the host valid.
 	if !httpguts.ValidHostHeader(host) {
 		// Historically, we would truncate the Host header after '/' or ' '.
@@ -663,8 +663,16 @@ func (r *Request) write(w io.Writer, usingProxy bool, extraHeaders Header, waitF
 		}
 	}
 	if stringContainsCTLByte(ruri) {
-		return errors.New("github.com/wangluozhe/chttp: can't write control character in Request.URL")
+		return errors.New("net/http: can't write control character in Request.URL")
 	}
+
+	// :protocol is only valid in HTTP/2 and HTTP/3. Transport allows it through
+	// header validation because it has not selected a connection yet. If the
+	// request reaches this HTTP/1 writer, reject it since it's not allowed.
+	if r.Header.has(":protocol") {
+		return errors.New("net/http: :protocol pseudo-header is not allowed in HTTP/1.x")
+	}
+
 	// TODO: validate r.Method too? At least it's less likely to
 	// come from an attacker (more likely to be a constant in
 	// code).
@@ -684,64 +692,41 @@ func (r *Request) write(w io.Writer, usingProxy bool, extraHeaders Header, waitF
 		return err
 	}
 
-	// Header lines
-	//_, err = fmt.Fprintf(w, "Host: %s\r\n", host)
-	//if err != nil {
-	//	return err
-	//}
-	if !r.Header.has("Host") {
-		r.Header.Set("Host", host)
-	}
-	if trace != nil && trace.WroteHeaderField != nil {
-		//trace.WroteHeaderField("Host", []string{host})
-		if !r.Header.has("Host") {
-			r.Header.Set("Host", host)
-		}
-	}
-
-	// Use the defaultUserAgent unless the Header contains one, which
-	// may be blank to not send the header.
-	userAgent := defaultUserAgent
-	if r.Header.has("User-Agent") {
-		userAgent = r.Header.Get("User-Agent")
-	}
-	if userAgent != "" {
-		userAgent = headerNewlineToSpace.Replace(userAgent)
-		userAgent = textproto.TrimString(userAgent)
-		//_, err = fmt.Fprintf(w, "User-Agent: %s\r\n", userAgent)
-		//if err != nil {
-		//	return err
-		//}
-		if !r.Header.has("User-Agent") {
-			r.Header.Set("User-Agent", textproto.TrimString(userAgent))
-		}
-		if trace != nil && trace.WroteHeaderField != nil {
-			//trace.WroteHeaderField("User-Agent", []string{userAgent})
-			if !r.Header.has("User-Agent") {
-				r.Header.Set("User-Agent", userAgent)
-			}
-		}
-	}
-
 	// Process Body,ContentLength,Close,Trailer
 	tw, err := newTransferWriter(r)
 	if err != nil {
 		return err
 	}
-	err = tw.writeHeader(w, trace)
-	if err != nil {
+	if err := tw.writeConnectionHeader(w, trace); err != nil {
 		return err
 	}
-	// Write Content-Length and/or Transfer-Encoding whose values are a
-	// function of the sanitized field triple (Body, ContentLength,
-	// TransferEncoding)
-	if tw.shouldSendContentLength() {
-		r.Header.Set("Content-Length", strconv.FormatInt(tw.ContentLength, 10))
-	} else if chunked(tw.TransferEncoding) {
-		r.Header.Set("Transfer-Encoding", "chunked")
+	if err := tw.writeTrailerHeader(w, trace); err != nil {
+		return err
 	}
 
-	err = r.Header.writeSubset(w, reqWriteExcludeHeader, trace)
+	hostHeader := host
+	if values := r.Header["Host"]; len(values) != 0 {
+		if len(values) != 1 {
+			return errors.New("http: multiple Host header values")
+		}
+		hostHeader, err = httpguts.PunycodeHostPort(values[0])
+		if err != nil {
+			return err
+		}
+		if !httpguts.ValidHostHeader(hostHeader) {
+			return errors.New("http: invalid Host header")
+		}
+		hostHeader = removeZone(hostHeader)
+	}
+	var fields [3]keyValues
+	generated := append(fields[:0], keyValues{key: "Host", values: []string{hostHeader}})
+	if !r.Header.has("User-Agent") {
+		generated = append(generated, keyValues{key: "User-Agent", values: []string{defaultUserAgent}})
+	}
+	if name, value := tw.framingHeader(); name != "" {
+		generated = append(generated, keyValues{key: name, values: []string{value}})
+	}
+	err = r.Header.writeSorted(w, reqWriteExcludeHeader, generated, trace)
 	if err != nil {
 		return err
 	}
@@ -804,19 +789,15 @@ func (r *Request) write(w io.Writer, usingProxy bool, extraHeaders Header, waitF
 
 // requestBodyReadError wraps an error from (*Request).write to indicate
 // that the error came from a Read call on the Request.Body.
-// This error type should not escape the github.com/wangluozhe/chttp package to users.
+// This error type should not escape the net/http package to users.
 type requestBodyReadError struct{ error }
 
 func idnaASCII(v string) (string, error) {
-	// TODO: Consider removing this check after verifying performance is okay.
-	// Right now punycode verification, length checks, context checks, and the
-	// permissible character tests are all omitted. It also prevents the ToASCII
-	// call from salvaging an invalid IDN, when possible. As a result it may be
-	// possible to have two IDNs that appear identical to the user where the
-	// ASCII-only version causes an error downstream whereas the non-ASCII
-	// version does not.
-	// Note that for correct ASCII IDNs ToASCII will only do considerably more
-	// work, but it will not cause an allocation.
+	// TODO: Follow the WHATWG URL Specification.
+	//
+	// WHATWG accepts all ASCII-only names (although sometimes with advisory
+	// validation errors), so skipping the relatively expensive IDNA processing
+	// on them is fine.
 	if ascii.Is(v) {
 		return v, nil
 	}
@@ -923,10 +904,10 @@ func NewRequestWithContext(ctx context.Context, method, url string, body io.Read
 		method = "GET"
 	}
 	if !validMethod(method) {
-		return nil, fmt.Errorf("github.com/wangluozhe/chttp: invalid method %q", method)
+		return nil, fmt.Errorf("net/http: invalid method %q", method)
 	}
 	if ctx == nil {
-		return nil, errors.New("github.com/wangluozhe/chttp: nil Context")
+		return nil, errors.New("net/http: nil Context")
 	}
 	u, err := urlpkg.Parse(url)
 	if err != nil {
@@ -1094,6 +1075,11 @@ func ReadRequest(b *bufio.Reader) (*Request, error) {
 	return req, nil
 }
 
+// readMIMEHeader is defined in package [net/textproto].
+//
+//go:linkname readMIMEHeader net/textproto.readMIMEHeader
+func readMIMEHeader(r *textproto.Reader, maxMemory, maxHeaders int64) (textproto.MIMEHeader, error)
+
 // readRequest should be an internal detail,
 // but widely used packages access it using linkname.
 // Notable members of the hall of shame include:
@@ -1106,6 +1092,10 @@ func ReadRequest(b *bufio.Reader) (*Request, error) {
 //
 //go:linkname readRequest
 func readRequest(b *bufio.Reader) (req *Request, err error) {
+	return readRequestLimit(b, math.MaxInt64)
+}
+
+func readRequestLimit(b *bufio.Reader, maxHeaders int64) (req *Request, err error) {
 	tp := newTextprotoReader(b)
 	defer putTextprotoReader(tp)
 
@@ -1159,8 +1149,12 @@ func readRequest(b *bufio.Reader) (req *Request, err error) {
 	}
 
 	// Subsequent lines: Key: value.
-	mimeHeader, err := tp.ReadMIMEHeader()
+	mimeHeader, err := readMIMEHeader(tp, math.MaxInt64, maxHeaders)
 	if err != nil {
+		// TODO: Add a distinguishable error to net/textproto.
+		if err.Error() == "message too large" {
+			return nil, errTooLarge
+		}
 		return nil, err
 	}
 	req.Header = Header(mimeHeader)
@@ -1184,7 +1178,7 @@ func readRequest(b *bufio.Reader) (req *Request, err error) {
 
 	req.Close = shouldClose(req.ProtoMajor, req.ProtoMinor, req.Header, false)
 
-	err = readTransfer(req, b)
+	err = readTransfer(req, b, maxHeaders)
 	if err != nil {
 		return nil, err
 	}
@@ -1495,6 +1489,9 @@ func (r *Request) FormFile(key string) (multipart.File, *multipart.FileHeader, e
 // that matched the request.
 // It returns the empty string if the request was not matched against a pattern
 // or there is no such wildcard in the pattern.
+//
+// The value is unescaped. For example, if the pattern "/b/{bucket}" matches
+// the path "/b/a%2fb", PathValue("bucket") returns "a/b".
 func (r *Request) PathValue(name string) string {
 	if i := r.patIndex(name); i >= 0 {
 		return r.matches[i]
@@ -1504,6 +1501,7 @@ func (r *Request) PathValue(name string) string {
 
 // SetPathValue sets name to value, so that subsequent calls to r.PathValue(name)
 // return value.
+// It does not unescape value.
 func (r *Request) SetPathValue(name, value string) {
 	if i := r.patIndex(name); i >= 0 {
 		r.matches[i] = value
@@ -1536,21 +1534,18 @@ func (r *Request) patIndex(name string) int {
 }
 
 func (r *Request) expectsContinue() bool {
-	return hasToken(r.Header.get("Expect"), "100-continue")
+	return httpguts.HeaderValuesContainsToken(r.Header["Expect"], "100-continue")
 }
 
 func (r *Request) wantsHttp10KeepAlive() bool {
 	if r.ProtoMajor != 1 || r.ProtoMinor != 0 {
 		return false
 	}
-	return hasToken(r.Header.get("Connection"), "keep-alive")
+	return httpguts.HeaderValuesContainsToken(r.Header["Connection"], "keep-alive")
 }
 
 func (r *Request) wantsClose() bool {
-	if r.Close {
-		return true
-	}
-	return hasToken(r.Header.get("Connection"), "close")
+	return r.Close || httpguts.HeaderValuesContainsToken(r.Header["Connection"], "close")
 }
 
 func (r *Request) closeBody() error {
@@ -1563,7 +1558,7 @@ func (r *Request) closeBody() error {
 func (r *Request) isReplayable() bool {
 	if r.Body == nil || r.Body == NoBody || r.GetBody != nil {
 		switch valueOrDefault(r.Method, "GET") {
-		case "GET", "HEAD", "OPTIONS", "TRACE":
+		case "GET", "HEAD", "OPTIONS", "TRACE", "QUERY":
 			return true
 		}
 		// The Idempotency-Key, while non-standard, is widely used to
@@ -1606,6 +1601,6 @@ func requestMethodUsuallyLacksBody(method string) bool {
 // requiresHTTP1 reports whether this request requires being sent on
 // an HTTP/1 connection.
 func (r *Request) requiresHTTP1() bool {
-	return hasToken(r.Header.Get("Connection"), "upgrade") &&
+	return httpguts.HeaderValuesContainsToken(r.Header["Connection"], "upgrade") &&
 		ascii.EqualFold(r.Header.Get("Upgrade"), "websocket")
 }

@@ -8,11 +8,12 @@ package httptrace
 
 import (
 	"context"
-	tls "github.com/refraction-networking/utls"
-	"github.com/wangluozhe/chttp/internal/nettrace"
 	"net"
+	stdtrace "net/http/httptrace"
 	"net/textproto"
 	"time"
+
+	tls "github.com/refraction-networking/utls"
 )
 
 // unique type to prevent assignment.
@@ -35,35 +36,22 @@ func WithClientTrace(ctx context.Context, trace *ClientTrace) context.Context {
 		panic("nil trace")
 	}
 	old := ContextClientTrace(ctx)
-	trace.compose(old)
-
-	ctx = context.WithValue(ctx, clientEventContextKey{}, trace)
 	if trace.hasNetHooks() {
-		nt := &nettrace.Trace{
+		// Route DNS and connect events through the hooks used by net.Dialer.
+		nt := &stdtrace.ClientTrace{
 			ConnectStart: trace.ConnectStart,
 			ConnectDone:  trace.ConnectDone,
 		}
-		if trace.DNSStart != nil {
-			nt.DNSStart = func(name string) {
-				trace.DNSStart(DNSStartInfo{Host: name})
-			}
+		if hook := trace.DNSStart; hook != nil {
+			nt.DNSStart = func(info stdtrace.DNSStartInfo) { hook(DNSStartInfo(info)) }
 		}
-		if trace.DNSDone != nil {
-			nt.DNSDone = func(netIPs []any, coalesced bool, err error) {
-				addrs := make([]net.IPAddr, len(netIPs))
-				for i, ip := range netIPs {
-					addrs[i] = ip.(net.IPAddr)
-				}
-				trace.DNSDone(DNSDoneInfo{
-					Addrs:     addrs,
-					Coalesced: coalesced,
-					Err:       err,
-				})
-			}
+		if hook := trace.DNSDone; hook != nil {
+			nt.DNSDone = func(info stdtrace.DNSDoneInfo) { hook(DNSDoneInfo(info)) }
 		}
-		ctx = context.WithValue(ctx, nettrace.TraceKey{}, nt)
+		ctx = stdtrace.WithClientTrace(ctx, nt)
 	}
-	return ctx
+	trace.compose(old)
+	return context.WithValue(ctx, clientEventContextKey{}, trace)
 }
 
 // ClientTrace is a set of hooks to run at various stages of an outgoing
@@ -94,8 +82,6 @@ type ClientTrace struct {
 	// successfully returned to the idle pool. If err is non-nil,
 	// it describes why not. PutIdleConn is not called if
 	// connection reuse is disabled via Transport.DisableKeepAlives.
-	// PutIdleConn is called before the caller's Response.Body.Close
-	// call returns.
 	// For HTTP/2, this hook is not currently used.
 	PutIdleConn func(err error)
 

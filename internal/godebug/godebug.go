@@ -44,15 +44,10 @@
 // documentation for details.
 package godebug
 
-// Note: Be careful about new imports here. Any package
-// that internal/godebug imports cannot itself import internal/godebug,
-// meaning it cannot introduce a GODEBUG setting of its own.
-// We keep imports to the absolute bare minimum.
 import (
+	"os"
 	"sync"
 	"sync/atomic"
-	"unsafe"
-	_ "unsafe" // go:linkname
 
 	"github.com/wangluozhe/chttp/internal/bisect"
 	"github.com/wangluozhe/chttp/internal/godebugs"
@@ -115,9 +110,6 @@ func (s *Setting) String() string {
 
 // IncNonDefault increments the non-default behavior counter
 // associated with the given setting.
-// This counter is exposed in the runtime/metrics value
-// /godebug/non-default-behavior/<name>:events.
-//
 // Note that Value must be called at least once before IncNonDefault.
 func (s *Setting) IncNonDefault() {
 	s.nonDefaultOnce.Do(s.register)
@@ -128,7 +120,6 @@ func (s *Setting) register() {
 	if s.info == nil || s.info.Opaque {
 		panic("godebug: unexpected IncNonDefault of " + s.name)
 	}
-	registerMetric("/godebug/non-default-behavior/"+s.Name()+":events", s.nonDefault.Load)
 }
 
 // cache is a cache of all the GODEBUG settings,
@@ -156,6 +147,7 @@ var empty value
 // Clients should therefore typically not attempt their own
 // caching of Value's result.
 func (s *Setting) Value() string {
+	refresh()
 	s.once.Do(func() {
 		s.setting = lookup(s.Name())
 		if s.info == nil && !s.Undocumented() {
@@ -163,7 +155,7 @@ func (s *Setting) Value() string {
 		}
 	})
 	v := *s.value.Load()
-	if v.bisect != nil && !v.bisect.Stack(&stderr) {
+	if v.bisect != nil && !v.bisect.Stack(os.Stderr) {
 		return ""
 	}
 	return v.text
@@ -185,42 +177,26 @@ func lookup(name string) *setting {
 	return s
 }
 
-// setUpdate is provided by package runtime in standard library.
-// For chttp we just provide a stub.
-func setUpdate(update func(string, string)) {}
+var (
+	updateMu sync.Mutex
+	lastEnv  atomic.Pointer[string]
+)
 
-// registerMetric is provided by package runtime in standard library.
-// For chttp we just provide a stub.
-func registerMetric(name string, read func() uint64) {}
-
-// setNewIncNonDefault is provided by package runtime in standard library.
-// For chttp we just provide a stub.
-func setNewIncNonDefault(newIncNonDefault func(string) func()) {}
-
-func init() {
-	setUpdate(update)
-	setNewIncNonDefault(newIncNonDefault)
-}
-
-func newIncNonDefault(name string) func() {
-	s := New(name)
-	s.Value()
-	return s.IncNonDefault
-}
-
-var updateMu sync.Mutex
-
-// update records an updated GODEBUG setting.
-// def is the default GODEBUG setting for the running binary,
-// and env is the current value of the $GODEBUG environment variable.
-func update(def, env string) {
+// refresh uses the process environment because chttp cannot subscribe to the
+// standard library's runtime GODEBUG callback.
+func refresh() {
+	prev := lastEnv.Load()
+	if env := os.Getenv("GODEBUG"); prev != nil && *prev == env {
+		return
+	}
 	updateMu.Lock()
 	defer updateMu.Unlock()
+	env := os.Getenv("GODEBUG")
+	if prev := lastEnv.Load(); prev != nil && *prev == env {
+		return
+	}
 
-	// Update all the cached values, creating new ones as needed.
-	// We parse the environment variable first, so that any settings it has
-	// are already locked in place (did[name] = true) before we consider
-	// the defaults. Existing immutable settings are always locked.
+	// Existing immutable settings are always locked.
 	did := make(map[string]bool)
 	cache.Range(func(name, s any) bool {
 		if info := s.(*setting).info; info != nil && info.Immutable {
@@ -229,7 +205,6 @@ func update(def, env string) {
 		return true
 	})
 	parse(did, env)
-	parse(did, def)
 
 	// Clear any cached values that are no longer present.
 	cache.Range(func(name, s any) bool {
@@ -238,6 +213,7 @@ func update(def, env string) {
 		}
 		return true
 	})
+	lastEnv.Store(&env)
 }
 
 // parse parses the GODEBUG setting string s,
@@ -280,20 +256,3 @@ func parse(did map[string]bool, s string) {
 		}
 	}
 }
-
-type runtimeStderr struct{}
-
-var stderr runtimeStderr
-
-func (*runtimeStderr) Write(b []byte) (int, error) {
-	if len(b) > 0 {
-		write(2, unsafe.Pointer(&b[0]), int32(len(b)))
-	}
-	return len(b), nil
-}
-
-// Since we cannot import os or syscall, use the runtime's write function
-// to print to standard error.
-//
-//go:linkname write runtime.write
-func write(fd uintptr, p unsafe.Pointer, n int32) int32

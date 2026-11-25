@@ -10,18 +10,10 @@ import (
 	"github.com/wangluozhe/chttp/internal/httpcommon"
 	"log"
 	"net/url"
-	"strconv"
-	"strings"
+	"slices"
 
 	"golang.org/x/net/http/httpguts"
 	"golang.org/x/net/http2/hpack"
-	"sort"
-)
-
-const (
-	HeaderOrderKey     = "Header-Order:"
-	PHeaderOrderKey    = "PHeader-Order:"
-	UnChangedHeaderKey = "UnChanged-HeaderKey:"
 )
 
 // writeFramer is implemented by any type that is used to write frames.
@@ -209,7 +201,7 @@ type writeResHeaders struct {
 
 func encKV(enc *hpack.Encoder, k, v string) {
 	if VerboseLogs {
-		log.Printf("http2: server encoding header %q = %q", strings.Clone(k), strings.Clone(v))
+		log.Printf("http2: server encoding header %q = %q", k, v)
 	}
 	enc.WriteField(hpack.HeaderField{Name: k, Value: v})
 }
@@ -230,8 +222,7 @@ func (w *writeResHeaders) writeFrame(ctx writeContext) error {
 	buf.Reset()
 
 	if w.httpResCode != 0 {
-		codeBuf := strconv.AppendInt(make([]byte, 0, 3), int64(w.httpResCode), 10)
-		encKV(enc, ":status", string(codeBuf))
+		encKV(enc, ":status", httpCodeString(w.httpResCode))
 	}
 
 	encodeHeaders(enc, w.h, w.trailers)
@@ -352,58 +343,24 @@ func (wu writeWindowUpdate) writeFrame(ctx writeContext) error {
 // is encoded only if k is in keys.
 func encodeHeaders(enc *hpack.Encoder, h Header, keys []string) {
 	if keys == nil {
-		if headerOrder, ok := h[HeaderOrderKey]; ok {
-			order := make(map[string]int)
-			for i, v := range headerOrder {
-				order[strings.ToLower(v)] = i
-			}
-			sorter := sorterPool.Get().(*sorter)
-			defer sorterPool.Put(sorter)
-			ks := sorter.Keys(h)
-			sort.SliceStable(ks, func(i, j int) bool {
-				iOrd, iOk := order[strings.ToLower(ks[i])]
-				jOrd, jOk := order[strings.ToLower(ks[j])]
-				if !iOk && !jOk {
-					return ks[i] < ks[j]
-				}
-				if !iOk {
-					return false
-				}
-				if !jOk {
-					return true
-				}
-				return iOrd < jOrd
+		sorter := sorterPool.Get().(*sorter)
+		// Using defer here, since the returned keys from the
+		// sorter.Keys method is only valid until the sorter
+		// is returned:
+		defer sorterPool.Put(sorter)
+		keys = sorter.Keys(h)
+		if order := h[httpcommon.HeaderOrderKey]; len(order) > 0 {
+			slices.SortStableFunc(keys, func(a, b string) int {
+				return httpcommon.HeaderOrderIndex(order, a) - httpcommon.HeaderOrderIndex(order, b)
 			})
-			keys = ks
-		} else {
-			sorter := sorterPool.Get().(*sorter)
-			// Using defer here, since the returned keys from the
-			// sorter.Keys method is only valid until the sorter
-			// is returned:
-			defer sorterPool.Put(sorter)
-			keys = sorter.Keys(h)
 		}
 	}
 	for _, k := range keys {
-		if k == HeaderOrderKey || k == PHeaderOrderKey || k == UnChangedHeaderKey {
+		if httpcommon.IsHeaderMetadata(k) {
 			continue
 		}
 		vv := h[k]
-		
-		isUnChanged := false
-		var unChangedKey string
-		if unChangedHeaderKeys, ok := h[UnChangedHeaderKey]; ok {
-			for _, unKey := range unChangedHeaderKeys {
-				if strings.ToLower(unKey) == strings.ToLower(k) {
-					isUnChanged = true
-					unChangedKey = unKey
-					break
-				}
-			}
-		}
-
-		var ascii bool
-		k, ascii = httpcommon.LowerHeader(k)
+		k, ascii := httpcommon.LowerHeader(k)
 		if !ascii {
 			// Skip writing invalid headers. Per RFC 7540, Section 8.1.2, header
 			// field names have to be ASCII characters (just as in HTTP/1.x).
@@ -415,11 +372,6 @@ func encodeHeaders(enc *hpack.Encoder, h Header, keys []string) {
 			// already be rejected at a higher level.
 			continue
 		}
-		
-		if isUnChanged {
-			k = unChangedKey
-		}
-		
 		isTE := k == "transfer-encoding"
 		for _, v := range vv {
 			if !httpguts.ValidHeaderFieldValue(v) {

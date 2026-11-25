@@ -1,7 +1,10 @@
 package http
 
 import (
+	"encoding/hex"
 	"fmt"
+	"net"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -44,12 +47,13 @@ func raiseExtensionError(info string) *errExtensionNotExist {
 }
 
 func parseUserAgent(userAgent string) string {
+	userAgent = strings.ToLower(userAgent)
 	switch {
-	case strings.Contains(strings.ToLower(userAgent), "chrome"):
+	case strings.Contains(userAgent, "chrome"):
 		return chrome
-	case strings.Contains(strings.ToLower(userAgent), "applewebkit"):
+	case strings.Contains(userAgent, "applewebkit"):
 		return chrome
-	case strings.Contains(strings.ToLower(userAgent), "firefox"):
+	case strings.Contains(userAgent, "firefox"):
 		return firefox
 	default:
 		return chrome
@@ -57,162 +61,169 @@ func parseUserAgent(userAgent string) string {
 
 }
 
+func (t *Transport) tlsClient(conn net.Conn, cfg *utls.Config, onlyH1 bool) (*utls.UConn, error) {
+	forceHTTP1 := onlyH1 || t.ForceHTTP1
+	protocols := t.Protocols
+	restrictALPN := protocols != nil && !(protocols.HTTP1() && protocols.HTTP2())
+	hello := t.ClientHelloHexStream
+	if t.TLSExtensions != nil && t.TLSExtensions.ClientHelloHexStream != "" {
+		hello = t.TLSExtensions.ClientHelloHexStream
+	}
+	if hello == "" && t.JA3 == "" {
+		switch {
+		case t.ForceHTTP1:
+			cfg.NextProtos = []string{"http/1.1"}
+		case restrictALPN && !onlyH1:
+			cfg.NextProtos = slices.DeleteFunc(slices.Clone(cfg.NextProtos), func(p string) bool {
+				return (p == "h2" && !protocols.HTTP2()) || (p == "http/1.1" && !protocols.HTTP1())
+			})
+		}
+		return utls.UClient(conn, cfg, utls.HelloGolang), nil
+	}
+
+	var spec *utls.ClientHelloSpec
+	var err error
+	if hello != "" {
+		raw, err := hex.DecodeString(hello)
+		if err != nil {
+			return nil, fmt.Errorf("http: decoding ClientHello: %w", err)
+		}
+		f := utls.Fingerprinter{AllowBluntMimicry: true, RealPSKResumption: true}
+		spec, err = f.FingerprintClientHello(raw)
+		if err != nil {
+			return nil, fmt.Errorf("http: parsing ClientHello: %w", err)
+		}
+		if !slices.ContainsFunc(spec.Extensions, func(ext utls.TLSExtension) bool {
+			_, ok := ext.(utls.PreSharedKeyExtension)
+			return ok
+		}) {
+			cfg.SessionTicketsDisabled = true
+		}
+	} else {
+		var extensions TLSExtensions
+		if t.TLSExtensions != nil {
+			extensions = *t.TLSExtensions
+		}
+		if extensions.KeyShareCurves != nil {
+			keys := slices.Clone(extensions.KeyShareCurves.KeyShares)
+			for i := range keys {
+				g := keys[i].Group
+				keys[i].Data = nil
+				if g>>8 == g&0xff && g&0xf == 0xa {
+					keys[i].Data = []byte{0}
+				}
+			}
+			extensions.KeyShareCurves = &utls.KeyShareExtension{KeyShares: keys}
+		}
+		// ApplyPreset deep-clones the spec. The other extension fields can be read directly.
+		spec, err = extensions.StringToSpec(t.JA3, t.UserAgent, false, t.RandomJA3)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if forceHTTP1 || restrictALPN {
+		selectALPN := func(next []string) []string {
+			if forceHTTP1 {
+				return []string{"http/1.1"}
+			}
+			return adjustNextProtos(next, *protocols)
+		}
+		spec.Extensions = slices.DeleteFunc(spec.Extensions, func(ext utls.TLSExtension) bool {
+			alpn, ok := ext.(*utls.ALPNExtension)
+			if !ok {
+				return false
+			}
+			alpn.AlpnProtocols = selectALPN(alpn.AlpnProtocols)
+			return len(alpn.AlpnProtocols) == 0
+		})
+		if len(cfg.EncryptedClientHelloConfigList) != 0 {
+			// uTLS takes the encrypted inner ClientHello's ALPN from the config.
+			cfg.NextProtos = selectALPN(cfg.NextProtos)
+		}
+	}
+	tlsConn := utls.UClient(conn, cfg, utls.HelloCustom)
+	if err := tlsConn.ApplyPreset(spec); err != nil {
+		return nil, err
+	}
+	return tlsConn, nil
+}
+
 // StringToSpec creates a ClientHelloSpec based on a JA3 string
 func (tlsExtensions *TLSExtensions) StringToSpec(ja3 string, userAgent string, forceHTTP1 bool, randomJA3 bool) (*utls.ClientHelloSpec, error) {
-	parsedUserAgent := parseUserAgent(userAgent)
+	tokens := strings.Split(ja3, ",")
+	if len(tokens) != 5 {
+		return nil, fmt.Errorf("http: invalid JA3: expected five fields")
+	}
+	if _, err := strconv.ParseUint(tokens[0], 10, 16); err != nil {
+		return nil, err
+	}
 	if tlsExtensions == nil {
 		tlsExtensions = &TLSExtensions{}
 	}
-	ext := tlsExtensions
-	extMap := genMap()
-	tokens := strings.Split(ja3, ",")
-
-	version := tokens[0]
-	ciphers := strings.Split(tokens[1], "-")
-	extensions := strings.Split(tokens[2], "-")
-	curves := strings.Split(tokens[3], "-")
-	if len(curves) == 1 && curves[0] == "" {
-		curves = []string{}
+	grease := parseUserAgent(userAgent) == chrome && !tlsExtensions.NotUsedGREASE
+	var curves []utls.CurveID
+	if grease {
+		curves = append(curves, utls.GREASE_PLACEHOLDER)
 	}
-	pointFormats := strings.Split(tokens[4], "-")
-	if len(pointFormats) == 1 && pointFormats[0] == "" {
-		pointFormats = []string{}
-	}
-	// parse curves
-	var targetCurves []utls.CurveID
-	if parsedUserAgent == chrome && !tlsExtensions.NotUsedGREASE {
-		targetCurves = append(targetCurves, utls.CurveID(utls.GREASE_PLACEHOLDER)) //append grease for Chrome browsers
-		if supportedVersionsExt, ok := extMap["43"]; ok {
-			if supportedVersions, ok := supportedVersionsExt.(*utls.SupportedVersionsExtension); ok {
-				supportedVersions.Versions = append([]uint16{utls.GREASE_PLACEHOLDER}, supportedVersions.Versions...)
+	if tokens[3] != "" {
+		for curve := range strings.SplitSeq(tokens[3], "-") {
+			id, err := strconv.ParseUint(curve, 10, 16)
+			if err != nil {
+				return nil, err
 			}
+			curves = append(curves, utls.CurveID(id))
 		}
-		if keyShareExt, ok := extMap["51"]; ok {
-			if keyShare, ok := keyShareExt.(*utls.KeyShareExtension); ok {
-				keyShare.KeyShares = append([]utls.KeyShare{{Group: utls.CurveID(utls.GREASE_PLACEHOLDER), Data: []byte{0}}}, keyShare.KeyShares...)
+	}
+	var pointFormats []byte
+	if tokens[4] != "" {
+		for point := range strings.SplitSeq(tokens[4], "-") {
+			id, err := strconv.ParseUint(point, 10, 8)
+			if err != nil {
+				return nil, err
 			}
-		}
-	} else {
-		if keyShareExt, ok := extMap["51"]; ok {
-			if keyShare, ok := keyShareExt.(*utls.KeyShareExtension); ok {
-				keyShare.KeyShares = append(keyShare.KeyShares, utls.KeyShare{Group: utls.CurveP256})
-			}
-		}
-	}
-	for _, c := range curves {
-		cid, err := strconv.ParseUint(c, 10, 16)
-		if err != nil {
-			return nil, err
-		}
-		targetCurves = append(targetCurves, utls.CurveID(cid))
-	}
-	extMap["10"] = &utls.SupportedCurvesExtension{Curves: targetCurves}
-
-	// parse point formats
-	var targetPointFormats []byte
-	for _, p := range pointFormats {
-		pid, err := strconv.ParseUint(p, 10, 8)
-		if err != nil {
-			return nil, err
-		}
-		targetPointFormats = append(targetPointFormats, byte(pid))
-	}
-	extMap["11"] = &utls.SupportedPointsExtension{SupportedPoints: targetPointFormats}
-
-	// force http1
-	if forceHTTP1 {
-		extMap["16"] = &utls.ALPNExtension{
-			AlpnProtocols: []string{"http/1.1"},
+			pointFormats = append(pointFormats, byte(id))
 		}
 	}
 
-	// custom tls extensions
-	if tlsExtensions != nil {
-		if ext.SupportedSignatureAlgorithms != nil {
-			extMap["13"] = ext.SupportedSignatureAlgorithms
-		}
-		if ext.CertCompressionAlgo != nil {
-			extMap["27"] = ext.CertCompressionAlgo
-		}
-		if ext.RecordSizeLimit != nil {
-			extMap["28"] = ext.RecordSizeLimit
-		}
-		if ext.DelegatedCredentials != nil {
-			extMap["34"] = ext.DelegatedCredentials
-		}
-		if ext.SupportedVersions != nil {
-			extMap["43"] = ext.SupportedVersions
-		}
-		if ext.PSKKeyExchangeModes != nil {
-			extMap["45"] = ext.PSKKeyExchangeModes
-		}
-		if ext.SignatureAlgorithmsCert != nil {
-			extMap["50"] = ext.SignatureAlgorithmsCert
-		}
-		if ext.KeyShareCurves != nil {
-			extMap["51"] = ext.KeyShareCurves
-		}
-		if ext.TrustAnchors != nil {
-			extMap["51764"] = ext.TrustAnchors
-		}
-	}
-
-	// set extension 43
-	vid64, err := strconv.ParseUint(version, 10, 16)
-	if err != nil {
-		return nil, err
-	}
-	vid := uint16(vid64)
-
-	// build extenions list
-	var exts []utls.TLSExtension
-	//Optionally Add Chrome Grease Extension
-	if parsedUserAgent == chrome && !tlsExtensions.NotUsedGREASE {
+	extensionIDs := strings.Split(tokens[2], "-")
+	exts := make([]utls.TLSExtension, 0, len(extensionIDs)+2)
+	if grease {
 		exts = append(exts, &utls.UtlsGREASEExtension{})
 	}
-	for i, e := range extensions {
-		te, ok := extMap[e]
-		if !ok {
-			return nil, raiseExtensionError(e)
+	for _, id := range extensionIDs {
+		ext := tlsExtensions.ja3Extension(id, curves, pointFormats, grease, forceHTTP1)
+		if ext == nil {
+			return nil, raiseExtensionError(id)
 		}
-		// //Optionally add Chrome Grease Extension
-		if i == len(extensions)-1 && (e == "41" || e == "21") && parsedUserAgent == chrome && !tlsExtensions.NotUsedGREASE {
-			exts = append(exts, &utls.UtlsGREASEExtension{})
-		}
-		exts = append(exts, te)
+		exts = append(exts, ext)
 	}
-
-	if parsedUserAgent == chrome && (extensions[len(extensions)-1] != "21" && extensions[len(extensions)-1] != "41") && !tlsExtensions.NotUsedGREASE {
+	if grease {
 		exts = append(exts, &utls.UtlsGREASEExtension{})
+		// Keep a final padding or pre_shared_key extension last.
+		if last := extensionIDs[len(extensionIDs)-1]; last == "21" || last == "41" {
+			exts[len(exts)-2], exts[len(exts)-1] = exts[len(exts)-1], exts[len(exts)-2]
+		}
 	}
 
-	// build CipherSuites
-	var suites []uint16
-	//Optionally Add Chrome Grease Extension
-	if parsedUserAgent == chrome && !tlsExtensions.NotUsedGREASE {
+	suites := make([]uint16, 0, 2+strings.Count(tokens[1], "-"))
+	if grease {
 		suites = append(suites, utls.GREASE_PLACEHOLDER)
 	}
-	for _, c := range ciphers {
+	for c := range strings.SplitSeq(tokens[1], "-") {
 		cid, err := strconv.ParseUint(c, 10, 16)
 		if err != nil {
 			return nil, err
 		}
 		suites = append(suites, uint16(cid))
 	}
-	_ = vid
-
-	// random ja3 extensions
 	if randomJA3 {
 		exts = utls.ShuffleChromeTLSExtensions(exts)
 	}
 
 	return &utls.ClientHelloSpec{
-		// TLSVersMin:         vid,
-		// TLSVersMax:         vid,
 		CipherSuites:       suites,
 		CompressionMethods: []byte{0},
 		Extensions:         exts,
-		//GetSessionID:       sha256.Sum256,
 	}, nil
 }
 
@@ -266,14 +277,21 @@ func chrome155TrustAnchorIDs() [][]byte {
 	}
 }
 
-func genMap() (extMap map[string]utls.TLSExtension) {
-	extMap = map[string]utls.TLSExtension{
-		"0": &utls.SNIExtension{},
-		"5": &utls.StatusRequestExtension{},
-		// These are applied later
-		// "10": &tls.SupportedCurvesExtension{...}
-		// "11": &tls.SupportedPointsExtension{...}
-		"13": &utls.SignatureAlgorithmsExtension{
+func (t *TLSExtensions) ja3Extension(id string, curves []utls.CurveID, points []byte, grease, forceHTTP1 bool) utls.TLSExtension {
+	switch id {
+	case "0":
+		return &utls.SNIExtension{}
+	case "5":
+		return &utls.StatusRequestExtension{}
+	case "10":
+		return &utls.SupportedCurvesExtension{Curves: curves}
+	case "11":
+		return &utls.SupportedPointsExtension{SupportedPoints: points}
+	case "13":
+		if t.SupportedSignatureAlgorithms != nil {
+			return t.SupportedSignatureAlgorithms
+		}
+		return &utls.SignatureAlgorithmsExtension{
 			SupportedSignatureAlgorithms: []utls.SignatureScheme{
 				utls.ECDSAWithP256AndSHA256,
 				utls.ECDSAWithP384AndSHA384,
@@ -287,42 +305,72 @@ func genMap() (extMap map[string]utls.TLSExtension) {
 				utls.ECDSAWithSHA1,
 				utls.PKCS1WithSHA1,
 			},
-		},
-		"16": &utls.ALPNExtension{
-			AlpnProtocols: []string{"h2", "http/1.1"},
-		},
-		"17": &utls.GenericExtension{Id: 17}, // status_request_v2
-		"18": &utls.SCTExtension{},
-		"21": &utls.UtlsPaddingExtension{GetPaddingLen: utls.BoringPaddingStyle},
-		"22": &utls.GenericExtension{Id: 22}, // encrypt_then_mac
-		"23": &utls.ExtendedMasterSecretExtension{},
-		"24": &utls.FakeTokenBindingExtension{},
-		"27": &utls.UtlsCompressCertExtension{
-			Algorithms: []utls.CertCompressionAlgo{utls.CertCompressionBrotli},
-		},
-		"28": &utls.FakeRecordSizeLimitExtension{
-			Limit: 0x4001,
-		}, //Limit: 0x4001
-		"34": &utls.DelegatedCredentialsExtension{
+		}
+	case "16":
+		if forceHTTP1 {
+			return &utls.ALPNExtension{AlpnProtocols: []string{"http/1.1"}}
+		}
+		return &utls.ALPNExtension{AlpnProtocols: []string{"h2", "http/1.1"}}
+	case "17":
+		return &utls.GenericExtension{Id: 17} // status_request_v2
+	case "18":
+		return &utls.SCTExtension{}
+	case "21":
+		return &utls.UtlsPaddingExtension{GetPaddingLen: utls.BoringPaddingStyle}
+	case "22":
+		return &utls.GenericExtension{Id: 22} // encrypt_then_mac
+	case "23":
+		return &utls.ExtendedMasterSecretExtension{}
+	case "24":
+		return &utls.FakeTokenBindingExtension{}
+	case "27":
+		if t.CertCompressionAlgo != nil {
+			return t.CertCompressionAlgo
+		}
+		return &utls.UtlsCompressCertExtension{Algorithms: []utls.CertCompressionAlgo{utls.CertCompressionBrotli}}
+	case "28":
+		if t.RecordSizeLimit != nil {
+			return t.RecordSizeLimit
+		}
+		return &utls.FakeRecordSizeLimitExtension{Limit: 0x4001}
+	case "34":
+		if t.DelegatedCredentials != nil {
+			return t.DelegatedCredentials
+		}
+		return &utls.DelegatedCredentialsExtension{
 			SupportedSignatureAlgorithms: []utls.SignatureScheme{
 				utls.ECDSAWithP256AndSHA256,
 				utls.ECDSAWithP384AndSHA384,
 				utls.ECDSAWithP521AndSHA512,
 				utls.ECDSAWithSHA1,
 			},
-		},
-		"35": &utls.SessionTicketExtension{},
-		"41": &utls.UtlsPreSharedKeyExtension{}, //FIXME pre_shared_key
-		"43": &utls.SupportedVersionsExtension{Versions: []uint16{
-			utls.VersionTLS13,
-			utls.VersionTLS12,
-		}},
-		"44": &utls.CookieExtension{},
-		"45": &utls.PSKKeyExchangeModesExtension{Modes: []uint8{
-			utls.PskModeDHE,
-		}},
-		"49": &utls.GenericExtension{Id: 49}, // post_handshake_auth
-		"50": &utls.SignatureAlgorithmsCertExtension{
+		}
+	case "35":
+		return &utls.SessionTicketExtension{}
+	case "41":
+		return &utls.UtlsPreSharedKeyExtension{}
+	case "43":
+		if t.SupportedVersions != nil {
+			return t.SupportedVersions
+		}
+		if grease {
+			return &utls.SupportedVersionsExtension{Versions: []uint16{utls.GREASE_PLACEHOLDER, utls.VersionTLS13, utls.VersionTLS12}}
+		}
+		return &utls.SupportedVersionsExtension{Versions: []uint16{utls.VersionTLS13, utls.VersionTLS12}}
+	case "44":
+		return &utls.CookieExtension{}
+	case "45":
+		if t.PSKKeyExchangeModes != nil {
+			return t.PSKKeyExchangeModes
+		}
+		return &utls.PSKKeyExchangeModesExtension{Modes: []uint8{utls.PskModeDHE}}
+	case "49":
+		return &utls.GenericExtension{Id: 49} // post_handshake_auth
+	case "50":
+		if t.SignatureAlgorithmsCert != nil {
+			return t.SignatureAlgorithmsCert
+		}
+		return &utls.SignatureAlgorithmsCertExtension{
 			SupportedSignatureAlgorithms: []utls.SignatureScheme{
 				utls.ECDSAWithP256AndSHA256,
 				utls.ECDSAWithP384AndSHA384,
@@ -336,30 +384,38 @@ func genMap() (extMap map[string]utls.TLSExtension) {
 				utls.ECDSAWithSHA1,
 				utls.PKCS1WithSHA1,
 			},
-		}, // signature_algorithms_cert
-		"51": &utls.KeyShareExtension{KeyShares: []utls.KeyShare{
-			{Group: utls.X25519},
-
-			// {Group: utls.CurveP384}, known bug missing correct extensions for handshake
-		}},
-		"57":    &utls.QUICTransportParametersExtension{},
-		"13172": &utls.NPNExtension{},
-		"17513": &utls.ApplicationSettingsExtension{
-			SupportedProtocols: []string{
-				"h2",
-			},
-		},
-		"17613": &utls.ApplicationSettingsExtensionNew{
-			SupportedProtocols: []string{
-				"h2",
-			},
-		},
-		"30032": &utls.GenericExtension{Id: 0x7550, Data: []byte{0}}, //FIXME
-		"51764": &utls.TrustAnchorsExtension{TrustAnchorIDs: chrome155TrustAnchorIDs()},
-		"65281": &utls.RenegotiationInfoExtension{
-			Renegotiation: utls.RenegotiateOnceAsClient,
-		},
-		"65037": utls.BoringGREASEECH(),
+		}
+	case "51":
+		if t.KeyShareCurves != nil {
+			return t.KeyShareCurves
+		}
+		if grease {
+			return &utls.KeyShareExtension{KeyShares: []utls.KeyShare{
+				{Group: utls.GREASE_PLACEHOLDER, Data: []byte{0}},
+				{Group: utls.X25519},
+			}}
+		}
+		return &utls.KeyShareExtension{KeyShares: []utls.KeyShare{{Group: utls.X25519}, {Group: utls.CurveP256}}}
+	case "57":
+		return &utls.QUICTransportParametersExtension{}
+	case "13172":
+		return &utls.NPNExtension{}
+	case "17513":
+		return &utls.ApplicationSettingsExtension{SupportedProtocols: []string{"h2"}}
+	case "17613":
+		return &utls.ApplicationSettingsExtensionNew{SupportedProtocols: []string{"h2"}}
+	case "30032":
+		return &utls.GenericExtension{Id: 30032, Data: []byte{0}}
+	case "51764":
+		if t.TrustAnchors != nil {
+			return t.TrustAnchors
+		}
+		return &utls.TrustAnchorsExtension{TrustAnchorIDs: chrome155TrustAnchorIDs()}
+	case "65037":
+		return utls.BoringGREASEECH()
+	case "65281":
+		return &utls.RenegotiationInfoExtension{Renegotiation: utls.RenegotiateOnceAsClient}
+	default:
+		return nil
 	}
-	return
 }

@@ -12,10 +12,10 @@
 //
 // To use pprof, link this package into your program:
 //
-//	import _ "net/http/pprof"
+//	import _ "github.com/wangluozhe/chttp/pprof"
 //
 // If your application is not already running an http server, you
-// need to start one. Add "net/http" and "log" to your imports and
+// need to start one. Add "github.com/wangluozhe/chttp" and "log" to your imports and
 // the following code to your main function:
 //
 //	go func() {
@@ -75,10 +75,12 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"github.com/wangluozhe/chttp"
 	"html"
+	"github.com/wangluozhe/chttp/internal/godebug"
+	"github.com/wangluozhe/chttp/internal/profile"
 	"io"
 	"log"
+	"github.com/wangluozhe/chttp"
 	"net/url"
 	"os"
 	"runtime"
@@ -88,10 +90,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/wangluozhe/chttp/internal/godebug"
-	"github.com/wangluozhe/chttp/internal/goexperiment"
-	"github.com/wangluozhe/chttp/internal/profile"
 )
 
 func init() {
@@ -261,7 +259,7 @@ func (name handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	gc, _ := strconv.Atoi(r.FormValue("gc"))
-	if name == "heap" && gc > 0 {
+	if (name == "heap" || name == "memory") && gc > 0 {
 		runtime.GC()
 	}
 	debug, _ := strconv.Atoi(r.FormValue("debug"))
@@ -270,6 +268,10 @@ func (name handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	} else {
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, name))
+	}
+	if string(name) == "memory" && debug > 0 {
+		serveError(w, http.StatusBadRequest, "memory profile: only debug=0 is supported")
+		return
 	}
 	p.WriteTo(w, debug)
 }
@@ -363,22 +365,18 @@ var profileSupportsDelta = map[handler]bool{
 }
 
 var profileDescriptions = map[string]string{
-	"allocs":       "A sampling of all past memory allocations",
-	"block":        "Stack traces that led to blocking on synchronization primitives",
-	"cmdline":      "The command line invocation of the current program",
-	"goroutine":    "Stack traces of all current goroutines. Use debug=2 as a query parameter to export in the same format as an unrecovered panic.",
-	"heap":         "A sampling of memory allocations of live objects. You can specify the gc GET parameter to run GC before taking the heap sample.",
-	"mutex":        "Stack traces of holders of contended mutexes",
-	"profile":      "CPU profile. You can specify the duration in the seconds GET parameter. After you get the profile file, use the go tool pprof command to investigate the profile.",
-	"symbol":       "Maps given program counters to function names. Counters can be specified in a GET raw query or POST body, multiple counters are separated by '+'.",
-	"threadcreate": "Stack traces that led to the creation of new OS threads",
-	"trace":        "A trace of execution of the current program. You can specify the duration in the seconds GET parameter. After you get the trace file, use the go tool trace command to investigate the trace.",
-}
-
-func init() {
-	if goexperiment.GoroutineLeakProfile {
-		profileDescriptions["goroutineleak"] = "Stack traces of all leaked goroutines. Use debug=2 as a query parameter to export in the same format as an unrecovered panic."
-	}
+	"allocs":        "A sampling of all past memory allocations",
+	"block":         "Stack traces that led to blocking on synchronization primitives",
+	"cmdline":       "The command line invocation of the current program",
+	"goroutine":     "Stack traces of all current goroutines. Use debug=2 as a query parameter to export in the same format as an unrecovered panic.",
+	"heap":          "A sampling of memory allocations of live objects. You can specify the gc GET parameter to run GC before taking the heap sample.",
+	"memory":        "A breakdown of process memory usage at the most recently completed garbage collection.",
+	"mutex":         "Stack traces of holders of contended mutexes",
+	"profile":       "CPU profile. You can specify the duration in the seconds GET parameter. After you get the profile file, use the go tool pprof command to investigate the profile.",
+	"symbol":        "Maps given program counters to function names. Counters can be specified in a GET raw query or POST body, multiple counters are separated by '+'.",
+	"threadcreate":  "Stack traces that led to the creation of new OS threads",
+	"trace":         "A trace of execution of the current program. You can specify the duration in the seconds GET parameter. After you get the trace file, use the go tool trace command to investigate the trace.",
+	"goroutineleak": "Stack traces of all leaked goroutines. Use debug=2 as a query parameter to export in the same format as an unrecovered panic.",
 }
 
 type profileEntry struct {

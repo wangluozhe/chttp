@@ -1,10 +1,13 @@
+//go:build ignore
+
 package main
 
 import (
 	"fmt"
+	"io"
+
 	utls "github.com/refraction-networking/utls"
 	http "github.com/wangluozhe/chttp"
-	"io"
 
 	"strconv"
 )

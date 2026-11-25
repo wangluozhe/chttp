@@ -1,11 +1,14 @@
+//go:build ignore
+
 package main
 
 import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"github.com/wangluozhe/chttp"
 	"io"
+
+	"github.com/wangluozhe/chttp"
 )
 
 var settings = map[string]http.HTTP2SettingID{

@@ -2,18 +2,6 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// TODO: turn off the serve goroutine when idle, so
-// an idle conn only has the readFrames goroutine active. (which could
-// also be optimized probably to pin less memory in tls "github.com/refraction-networking/utls"). This
-// would involve tracking when the serve goroutine is active (atomic
-// int32 read/CAS probably?) and starting it up when frames arrive,
-// and shutting it down when all handlers exit. the occasional PING
-// packets could use time.AfterFunc to call sc.wakeStartServeLoop()
-// (which is a no-op if already running) and then queue the PING write
-// as normal. The serve loop would then exit in most cases (if no
-// Handlers running) and not be woken up again until the PING packet
-// returns.
-
 // TODO (maybe): add a mechanism for Handlers to going into
 // half-closed-local mode (rw.(io.Closer) test?) but not exit their
 // handler, and continue to be able to read from the
@@ -30,15 +18,17 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	tls "github.com/refraction-networking/utls"
 	"errors"
 	"fmt"
-	tls "github.com/refraction-networking/utls"
-	"github.com/wangluozhe/chttp/internal"
-	"github.com/wangluozhe/chttp/internal/httpcommon"
+	"github.com/wangluozhe/chttp/internal/godebug"
 	"io"
 	"log"
 	"math"
 	"net"
+	"github.com/wangluozhe/chttp/internal"
+	"github.com/wangluozhe/chttp/internal/ascii"
+	"github.com/wangluozhe/chttp/internal/httpcommon"
 	"net/textproto"
 	"net/url"
 	"os"
@@ -48,6 +38,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/http/httpguts"
@@ -75,9 +66,20 @@ var (
 
 var responseWriterStatePool = sync.Pool{
 	New: func() any {
-		rws := &responseWriterState{}
-		rws.bw = bufio.NewWriterSize(chunkWriter{rws}, handlerChunkWriteSize)
-		return rws
+		return &responseWriterState{}
+	},
+}
+
+// handlerWriterPool is a pool of the bufio.Writers used by
+// responseWriterState (rws.bw) to buffer handler response writes.
+//
+// The buffers are acquired from the pool lazily on the first buffered
+// write and, notably, are returned to it by Flush when empty, so that a
+// handler that's parked mid-response for a long time (e.g. streaming a
+// long poll) doesn't pin a buffer per stream.
+var handlerWriterPool = sync.Pool{
+	New: func() any {
+		return bufio.NewWriterSize(nil, handlerChunkWriteSize)
 	},
 }
 
@@ -90,158 +92,51 @@ var (
 
 // Server is an HTTP/2 server.
 type Server struct {
-	// MaxHandlers limits the number of http.Handler ServeHTTP goroutines
-	// which may run at a time over all connections.
-	// Negative or zero no limit.
-	// TODO: implement
-	MaxHandlers int
-
-	// MaxConcurrentStreams optionally specifies the number of
-	// concurrent streams that each client may have open at a
-	// time. This is unrelated to the number of http.Handler goroutines
-	// which may be active globally, which is MaxHandlers.
-	// If zero, MaxConcurrentStreams defaults to at least 100, per
-	// the HTTP/2 spec's recommendations.
-	MaxConcurrentStreams uint32
-
-	// MaxDecoderHeaderTableSize optionally specifies the http2
-	// SETTINGS_HEADER_TABLE_SIZE to send in the initial settings frame. It
-	// informs the remote endpoint of the maximum size of the header compression
-	// table used to decode header blocks, in octets. If zero, the default value
-	// of 4096 is used.
-	MaxDecoderHeaderTableSize uint32
-
-	// MaxEncoderHeaderTableSize optionally specifies an upper limit for the
-	// header compression table used for encoding request headers. Received
-	// SETTINGS_HEADER_TABLE_SIZE settings are capped at this limit. If zero,
-	// the default value of 4096 is used.
-	MaxEncoderHeaderTableSize uint32
-
-	// MaxReadFrameSize optionally specifies the largest frame
-	// this server is willing to read. A valid value is between
-	// 16k and 16M, inclusive. If zero or otherwise invalid, a
-	// default value is used.
-	MaxReadFrameSize uint32
-
-	// PermitProhibitedCipherSuites, if true, permits the use of
-	// cipher suites prohibited by the HTTP/2 spec.
-	PermitProhibitedCipherSuites bool
-
-	// IdleTimeout specifies how long until idle clients should be
-	// closed with a GOAWAY frame. PING frames are not considered
-	// activity for the purposes of IdleTimeout.
-	// If zero or negative, there is no timeout.
-	IdleTimeout time.Duration
-
-	// ReadIdleTimeout is the timeout after which a health check using a ping
-	// frame will be carried out if no frame is received on the connection.
-	// If zero, no health check is performed.
-	ReadIdleTimeout time.Duration
-
-	// PingTimeout is the timeout after which the connection will be closed
-	// if a response to a ping is not received.
-	// If zero, a default of 15 seconds is used.
-	PingTimeout time.Duration
-
-	// WriteByteTimeout is the timeout after which a connection will be
-	// closed if no data can be written to it. The timeout begins when data is
-	// available to write, and is extended whenever any bytes are written.
-	// If zero or negative, there is no timeout.
-	WriteByteTimeout time.Duration
-
-	// MaxUploadBufferPerConnection is the size of the initial flow
-	// control window for each connections. The HTTP/2 spec does not
-	// allow this to be smaller than 65535 or larger than 2^32-1.
-	// If the value is outside this range, a default value will be
-	// used instead.
-	MaxUploadBufferPerConnection int32
-
-	// MaxUploadBufferPerStream is the size of the initial flow control
-	// window for each stream. The HTTP/2 spec does not allow this to
-	// be larger than 2^32-1. If the value is zero or larger than the
-	// maximum, a default value will be used instead.
-	MaxUploadBufferPerStream int32
-
-	// NewWriteScheduler constructs a write scheduler for a connection.
-	// If nil, a default scheduler is chosen.
-	NewWriteScheduler func() WriteScheduler
-
-	// CountError, if non-nil, is called on HTTP/2 server errors.
-	// It's intended to increment a metric for monitoring, such
-	// as an expvar or Prometheus metric.
-	// The errType consists of only ASCII word characters.
-	CountError func(errType string)
-
-	// Internal state. This is a pointer (rather than embedded directly)
-	// so that we don't embed a Mutex in this struct, which will make the
-	// struct non-copyable, which might break some callers.
-	state *serverInternalState
-}
-
-type serverInternalState struct {
 	mu          sync.Mutex
 	activeConns map[*serverConn]struct{}
-
-	// Pool of error channels. This is per-Server rather than global
-	// because channels can't be reused across synctest bubbles.
 	errChanPool sync.Pool
 }
 
-func (s *serverInternalState) registerConn(sc *serverConn) {
-	if s == nil {
-		return // if the Server was used without calling ConfigureServer
-	}
+func (s *Server) registerConn(sc *serverConn) {
 	s.mu.Lock()
 	s.activeConns[sc] = struct{}{}
 	s.mu.Unlock()
 }
 
-func (s *serverInternalState) unregisterConn(sc *serverConn) {
-	if s == nil {
-		return // if the Server was used without calling ConfigureServer
-	}
+func (s *Server) unregisterConn(sc *serverConn) {
 	s.mu.Lock()
 	delete(s.activeConns, sc)
 	s.mu.Unlock()
 }
 
-func (s *serverInternalState) startGracefulShutdown() {
-	if s == nil {
-		return // if the Server was used without calling ConfigureServer
-	}
+func (s *Server) GracefulShutdown() {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	for sc := range s.activeConns {
 		sc.startGracefulShutdown()
 	}
-	s.mu.Unlock()
 }
 
-// Global error channel pool used for uninitialized Servers.
-// We use a per-Server pool when possible to avoid using channels across synctest bubbles.
-var errChanPool = sync.Pool{
-	New: func() any { return make(chan error, 1) },
-}
-
-func (s *serverInternalState) getErrChan() chan error {
-	if s == nil {
-		return errChanPool.Get().(chan error) // Server used without calling ConfigureServer
+// errChanPool is a pool of reusable channels for reporting the result
+// of a blocking frame write.
+//
+// Keep the pool on the server so independent synctest servers cannot share channels.
+func (s *Server) getErrChan() chan error {
+	if s.errChanPool.New == nil {
+		return make(chan error, 1)
 	}
 	return s.errChanPool.Get().(chan error)
 }
 
-func (s *serverInternalState) putErrChan(ch chan error) {
-	if s == nil {
-		errChanPool.Put(ch) // Server used without calling ConfigureServer
-		return
+func (s *Server) putErrChan(ch chan error) {
+	if s.errChanPool.New != nil {
+		s.errChanPool.Put(ch)
 	}
-	s.errChanPool.Put(ch)
 }
 
 func (s *Server) Configure(conf ServerConfig, tcfg *tls.Config) error {
-	s.state = &serverInternalState{
-		activeConns: make(map[*serverConn]struct{}),
-		errChanPool: sync.Pool{New: func() any { return make(chan error, 1) }},
-	}
+	s.activeConns = make(map[*serverConn]struct{})
+	s.errChanPool.New = func() any { return make(chan error, 1) }
 
 	if tcfg.CipherSuites != nil && tcfg.MinVersion < tls.VersionTLS13 {
 		// If they already provided a TLS 1.0–1.2 CipherSuite list, return an
@@ -272,43 +167,53 @@ func (s *Server) Configure(conf ServerConfig, tcfg *tls.Config) error {
 	return nil
 }
 
-func (s *Server) GracefulShutdown() {
-	s.state.startGracefulShutdown()
-}
-
 // ServeConnOpts are options for the Server.ServeConn method.
 type ServeConnOpts struct {
 	// Context is the base context to use.
 	// If nil, context.Background is used.
 	Context context.Context
 
-	// BaseConfig optionally sets the base configuration
-	// for values. If nil, defaults are used.
+	// BaseConfig is the configuration of the net/http.Server
+	// which is serving this connection.
 	BaseConfig ServerConfig
 
-	// Handler specifies which handler to use for processing
-	// requests. If nil, BaseConfig.Handler is used. If BaseConfig
-	// or BaseConfig.Handler is nil, http.DefaultServeMux is used.
-	Handler Handler
+	// HandleRequest specifies which function to use for processing requests.
+	HandleRequest func(*ResponseWriter, *ServerRequest) error
 
 	// Settings is the decoded contents of the HTTP2-Settings header
 	// in an h2c upgrade request.
 	Settings []byte
 
+	UpgradeRequest *ServerRequest
+
 	// SawClientPreface is set if the HTTP/2 connection preface
 	// has already been read from the connection.
 	SawClientPreface bool
+
+	// OnClose is an optional callback that runs exactly once, after the
+	// connection is done being served and has been closed. It may run on
+	// any goroutine.
+	//
+	// Setting OnClose also grants ServeConn permission to return before
+	// the connection is done (see the ServeConn documentation), so
+	// callers providing it must release their per-connection resources
+	// here rather than after ServeConn returns.
+	OnClose func()
 }
 
 func (o *ServeConnOpts) context() context.Context {
-	if o != nil && o.Context != nil {
+	if o.Context != nil {
 		return o.Context
 	}
 	return context.Background()
 }
 
 // ServeConn serves HTTP/2 requests on the provided connection and
-// blocks until the connection is no longer readable.
+// blocks until the connection is no longer readable. As an exception,
+// if opts.OnClose is set, ServeConn may instead return as soon as the
+// connection goes idle, handing its servicing off to background
+// goroutines; the connection is still being served after ServeConn
+// returns, and opts.OnClose reports when it is done.
 //
 // ServeConn starts speaking HTTP/2 assuming that c has not had any
 // reads or writes. It writes its initial settings frame and expects
@@ -338,23 +243,24 @@ func (s *Server) ServeConn(c net.Conn, opts *ServeConnOpts) {
 type contextKey string
 
 var (
-	NewConnContextKey         = func() *string { s := "NewConnContextKey"; return &s }()
-	ConnectionStateContextKey = func() *string { s := "ConnectionStateContextKey"; return &s }()
+	NewConnContextKey         = new("NewConnContextKey")
+	ConnectionStateContextKey = new("ConnectionStateContextKey")
 )
 
 func (s *Server) serveConn(c net.Conn, opts *ServeConnOpts, newf func(*serverConn)) {
 	baseCtx, cancel := serverConnBaseContext(c, opts)
-	defer cancel()
 
-	conf := configFromServer(opts.BaseConfig, s)
+	conf := configFromServer(opts.BaseConfig)
 	sc := &serverConn{
 		srv:                         s,
 		hs:                          opts.BaseConfig,
 		conn:                        c,
 		baseCtx:                     baseCtx,
+		baseCtxCancel:               cancel,
+		onClose:                     opts.OnClose,
 		remoteAddrStr:               c.RemoteAddr().String(),
 		bw:                          newBufferedWriter(c, conf.WriteByteTimeout),
-		handler:                     opts.Handler,
+		handleRequest:               opts.HandleRequest,
 		streams:                     make(map[uint32]*stream),
 		readFrameCh:                 make(chan readFrameResult),
 		wantWriteFrameCh:            make(chan FrameWriteRequest, 8),
@@ -364,34 +270,39 @@ func (s *Server) serveConn(c net.Conn, opts *ServeConnOpts, newf func(*serverCon
 		doneServing:                 make(chan struct{}),
 		clientMaxStreams:            math.MaxUint32, // Section 6.5.2: "Initially, there is no limit to this value"
 		advMaxStreams:               uint32(conf.MaxConcurrentStreams),
-		initialStreamSendWindowSize: initialWindowSize,
 		initialStreamRecvWindowSize: int32(conf.MaxReceiveBufferPerStream),
 		maxFrameSize:                initialMaxFrameSize,
 		pingTimeout:                 conf.PingTimeout,
 		countErrorFunc:              conf.CountError,
-		serveG:                      newGoroutineLock(),
 		pushEnabled:                 true,
 		sawClientPreface:            opts.SawClientPreface,
+	}
+	sc.serveG.setOwner() // serve is called below on this same goroutine
+	sc.resumeServeFunc = sc.resumeServe
+	if opts.OnClose != nil && http2serveparking.Value() != "0" {
+		sc.serveParkingEnabled = true
 	}
 	if newf != nil {
 		newf(sc)
 	}
 
-	s.state.registerConn(sc)
-	defer s.state.unregisterConn(sc)
-
-	// The net/http package sets the write deadline from the
-	// http.Server.WriteTimeout during the TLS handshake, but then
-	// passes the connection off to us with the deadline already set.
-	// Write deadlines are set per stream in serverConn.newStream.
-	// Disarm the net.Conn write deadline here.
-	if sc.hs.WriteTimeout() > 0 {
-		sc.conn.SetWriteDeadline(time.Time{})
-	}
+	s.registerConn(sc)
+	served := false
+	defer func() {
+		if !served {
+			// We never made it to sc.serve, whose teardown owns
+			// releasing the connection's resources, so release them
+			// here instead. (We either rejected the connection or
+			// panicked during setup.)
+			s.unregisterConn(sc)
+			cancel()
+			if f := sc.onClose; f != nil {
+				f()
+			}
+		}
+	}()
 
 	switch {
-	case s.NewWriteScheduler != nil:
-		sc.writeSched = s.NewWriteScheduler()
 	case sc.hs.DisableClientPriority():
 		sc.writeSched = newRoundRobinWriteScheduler()
 	default:
@@ -401,7 +312,7 @@ func (s *Server) serveConn(c net.Conn, opts *ServeConnOpts, newf func(*serverCon
 	// These start at the RFC-specified defaults. If there is a higher
 	// configured value for inflow, that will be updated when we send a
 	// WINDOW_UPDATE shortly after sending SETTINGS.
-	sc.flow.add(initialWindowSize)
+	sc.flow.init()
 	sc.inflow.init(initialWindowSize)
 	sc.hpackEncoder = hpack.NewEncoder(&sc.headerWriteBuf)
 	sc.hpackEncoder.SetMaxDynamicTableSizeLimit(uint32(conf.MaxEncoderHeaderTableSize))
@@ -410,8 +321,21 @@ func (s *Server) serveConn(c net.Conn, opts *ServeConnOpts, newf func(*serverCon
 	if conf.CountError != nil {
 		fr.countError = conf.CountError
 	}
-	fr.ReadMetaHeaders = hpack.NewDecoder(uint32(conf.MaxDecoderHeaderTableSize), nil)
+	// A decoder table size below the initial 4096 (RFC 7540, Section 6.5.2)
+	// can't be applied immediately: the client may keep using the initial
+	// size until it processes our SETTINGS frame (RFC 7540, Section 6.5.3),
+	// and it signals the reduction with a dynamic table size update at the
+	// beginning of the first header block following the settings
+	// acknowledgment (RFC 7541, Section 4.2). Start at the initial size and
+	// lower it when the client acknowledges our SETTINGS. See processSettings.
+	decoderTableSize := uint32(conf.MaxDecoderHeaderTableSize)
+	if decoderTableSize < initialHeaderTableSize {
+		sc.pendingDecoderTableSize = decoderTableSize
+		decoderTableSize = initialHeaderTableSize
+	}
+	fr.ReadMetaHeaders = hpack.NewDecoder(decoderTableSize, nil)
 	fr.MaxHeaderListSize = sc.maxHeaderListSize()
+	fr.MaxHeaderValueCount = sc.hs.MaxHeaderValueCount()
 	fr.SetMaxReadFrameSize(uint32(conf.MaxReadFrameSize))
 	sc.framer = fr
 
@@ -482,6 +406,12 @@ func (s *Server) serveConn(c net.Conn, opts *ServeConnOpts, newf func(*serverCon
 		opts.Settings = nil
 	}
 
+	if opts.UpgradeRequest != nil {
+		sc.upgradeRequest(opts.UpgradeRequest)
+		opts.UpgradeRequest = nil
+	}
+
+	served = true
 	sc.serve(conf)
 }
 
@@ -499,33 +429,66 @@ func (sc *serverConn) rejectConn(err ErrCode, debug string) {
 
 type serverConn struct {
 	// Immutable:
-	srv              *Server
-	hs               ServerConfig
-	conn             net.Conn
-	bw               *bufferedWriter // writing to conn
-	handler          Handler
-	baseCtx          context.Context
-	framer           *Framer
-	doneServing      chan struct{}          // closed when serverConn.serve ends
-	readFrameCh      chan readFrameResult   // written by serverConn.readFrames
-	wantWriteFrameCh chan FrameWriteRequest // from handlers -> serve
-	wroteFrameCh     chan frameWriteResult  // from writeFrameAsync -> serve, tickles more frame writes
-	bodyReadCh       chan bodyReadMsg       // from handlers -> serve
-	serveMsgCh       chan any               // misc messages & code to send to / run on the serve loop
-	flow             outflow                // conn-wide (not stream-specific) outbound flow control
-	inflow           inflow                 // conn-wide inbound flow control
-	tlsState         *tls.ConnectionState   // shared by all handlers, like net/http
-	remoteAddrStr    string
-	writeSched       WriteScheduler
-	countErrorFunc   func(errType string)
+	srv           *Server // for unregisterConn in teardown
+	hs            ServerConfig
+	conn          net.Conn
+	bw            *bufferedWriter // writing to conn
+	handleRequest func(*ResponseWriter, *ServerRequest) error
+	baseCtx       context.Context
+	baseCtxCancel context.CancelFunc
+	onClose       func() // or nil; from ServeConnOpts.OnClose, called by teardown
+
+	// serveParkingEnabled is whether this connection's serve goroutine
+	// may park when the connection is idle. It requires the OnClose
+	// hook (which is what lets ServeConn return early) and
+	// GODEBUG=http2serveparking to be enabled. It is set once in
+	// serveConn, before any goroutine that sends to the serve loop's
+	// channels exists, and never changes, so it can be read without a
+	// lock, letting beginServeSend and endServeSend skip the parkState
+	// accounting on connections that can never park.
+	serveParkingEnabled bool
+	framer              *Framer
+	doneServing         chan struct{}          // closed by teardown when the connection is done
+	readFrameCh         chan readFrameResult   // written by serverConn.readFrames
+	wantWriteFrameCh    chan FrameWriteRequest // from handlers -> serve
+	wroteFrameCh        chan frameWriteResult  // from writeFrameAsync -> serve, tickles more frame writes
+	bodyReadCh          chan bodyReadMsg       // from handlers -> serve
+	serveMsgCh          chan any               // misc messages & code to send to / run on the serve loop
+	flow                connOutflow            // conn-wide (not stream-specific) outbound flow control
+	inflow              inflow                 // conn-wide inbound flow control
+	tlsState            *tls.ConnectionState   // shared by all handlers, like net/http
+	remoteAddrStr       string
+	writeSched          WriteScheduler
+	countErrorFunc      func(errType string)
+
+	// resumeServeFunc is sc.resumeServe, allocated once at setup so
+	// that beginServeSend's "go sc.resumeServeFunc()" doesn't allocate
+	// a method-value closure per park/resume cycle.
+	resumeServeFunc func()
+
+	// parkState coordinates parking the serve goroutine (exiting it
+	// while the connection is idle) with the goroutines that send it
+	// work. See serverConn.serveLoop.
+	//
+	// Its low bits count the sends to serve's channels that have been
+	// begun but not yet received by serve (see beginServeSend), and
+	// its parkedBit is set while the serve goroutine has exited and
+	// the next sender must revive it. The bit is only ever set while
+	// the count is zero, so tryPark's whole condition is a single
+	// compare-and-swap from zero.
+	parkState atomic.Int64
 
 	// Everything following is owned by the serve loop; use serveG.check():
-	serveG                      goroutineLock // used to verify funcs are on serve()
+	serveG                      goroutineLocker // used to verify funcs are on serve()
 	pushEnabled                 bool
 	sawClientPreface            bool // preface has already been read, used in h2c upgrade
 	sawFirstSettings            bool // got the initial SETTINGS frame after the preface
 	needToSendSettingsAck       bool
 	unackedSettings             int    // how many SETTINGS have we sent without ACKs?
+	pendingDecoderTableSize     uint32 // if non-zero, HPACK decoder table size to apply on SETTINGS ack
+	pendingEncoderTableSize     bool   // peer changed SETTINGS_HEADER_TABLE_SIZE; apply to hpackEncoder before the next frame write
+	encoderTableSizeMin         uint32 // smallest SETTINGS_HEADER_TABLE_SIZE since the last apply
+	encoderTableSize            uint32 // latest SETTINGS_HEADER_TABLE_SIZE
 	queuedControlFrames         int    // control frames in the writeSched queue
 	clientMaxStreams            uint32 // SETTINGS_MAX_CONCURRENT_STREAMS from client (our PUSH_PROMISE limit)
 	advMaxStreams               uint32 // our SETTINGS_MAX_CONCURRENT_STREAMS advertised the client
@@ -536,7 +499,6 @@ type serverConn struct {
 	maxPushPromiseID            uint32 // ID of the last push promise (even), or 0 if there have been no pushes
 	streams                     map[uint32]*stream
 	unstartedHandlers           []unstartedHandler
-	initialStreamSendWindowSize int32
 	initialStreamRecvWindowSize int32
 	maxFrameSize                int32
 	peerMaxHeaderListSize       uint32            // zero means unknown (default)
@@ -556,6 +518,9 @@ type serverConn struct {
 	readIdleTimeout             time.Duration
 	pingTimeout                 time.Duration
 	readIdleTimer               *time.Timer // nil if unused
+	settingsTimer               *time.Timer // fires if the client never sends SETTINGS; nil after the first frame arrives
+	lastFrameTime               time.Time   // when we last read a frame from the client
+	loopNum                     int         // serve loop iteration counter, observable by tests
 
 	// Owned by the writeFrameAsync goroutine:
 	headerWriteBuf bytes.Buffer
@@ -567,6 +532,8 @@ type serverConn struct {
 	// Used for RFC 9218 prioritization.
 	hasIntermediary bool // connection is done via an intermediary / proxy
 	priorityAware   bool // the client has sent priority signal, meaning that it is aware of it.
+
+	extendedConnectAllowed bool // server advertised ENABLE_CONNECT_PROTOCOL to this client
 }
 
 func (sc *serverConn) writeSchedIgnoresRFC7540() bool {
@@ -606,7 +573,8 @@ type stream struct {
 	// immutable:
 	sc        *serverConn
 	id        uint32
-	body      *pipe       // non-nil if expecting DATA frames
+	body      *pipe // non-nil if expecting DATA frames
+	reqBody   *requestBody
 	cw        closeWaiter // closed wait stream transitions to closed state
 	ctx       context.Context
 	cancelCtx func()
@@ -780,9 +748,11 @@ func (sc *serverConn) readFrames() {
 	gateDone := func() { gate <- struct{}{} }
 	for {
 		f, err := sc.framer.ReadFrame()
+		sc.beginServeSend()
 		select {
 		case sc.readFrameCh <- readFrameResult{f, err, gateDone}:
 		case <-sc.doneServing:
+			sc.endServeSend()
 			return
 		}
 		select {
@@ -814,6 +784,7 @@ func (sc *serverConn) writeFrameAsync(wr FrameWriteRequest, wd *writeData) {
 	} else {
 		err = sc.framer.endWrite()
 	}
+	sc.beginServeSend()
 	sc.wroteFrameCh <- frameWriteResult{wr: wr, err: err}
 }
 
@@ -849,10 +820,12 @@ func (sc *serverConn) notePanic() {
 func (sc *serverConn) serve(conf Config) {
 	sc.serveG.check()
 	defer sc.notePanic()
-	defer sc.conn.Close()
-	defer sc.closeAllStreamsOnConnClose()
-	defer sc.stopShutdownTimer()
-	defer close(sc.doneServing) // unblocks handlers trying to send
+	parked := false
+	defer func() {
+		if !parked {
+			sc.teardown()
+		}
+	}()
 
 	if VerboseLogs {
 		sc.vlogf("http2: server connection from %v on %p", sc.conn.RemoteAddr(), sc.hs)
@@ -865,7 +838,8 @@ func (sc *serverConn) serve(conf Config) {
 		{SettingHeaderTableSize, uint32(conf.MaxDecoderHeaderTableSize)},
 		{SettingInitialWindowSize, uint32(sc.initialStreamRecvWindowSize)},
 	}
-	if !disableExtendedConnectProtocol {
+	if conf.EnableConnectProtocol || !disableExtendedConnectProtocol {
+		sc.extendedConnectAllowed = true
 		settings = append(settings, Setting{SettingEnableConnectProtocol, 1})
 	}
 	if sc.writeSchedIgnoresRFC7540() {
@@ -893,73 +867,147 @@ func (sc *serverConn) serve(conf Config) {
 	sc.setConnState(ConnStateActive)
 	sc.setConnState(ConnStateIdle)
 
-	if sc.srv.IdleTimeout > 0 {
-		sc.idleTimer = time.AfterFunc(sc.srv.IdleTimeout, sc.onIdleTimer)
-		defer sc.idleTimer.Stop()
+	if idle := sc.hs.IdleTimeout(); idle > 0 {
+		sc.idleTimer = time.AfterFunc(idle, sc.onIdleTimer)
 	}
 
 	if conf.SendPingTimeout > 0 {
 		sc.readIdleTimeout = conf.SendPingTimeout
 		sc.readIdleTimer = time.AfterFunc(conf.SendPingTimeout, sc.onReadIdleTimer)
-		defer sc.readIdleTimer.Stop()
 	}
 
-	go sc.readFrames() // closed by defer sc.conn.Close above
+	go sc.readFrames() // closed by the conn.Close in sc.teardown
 
-	settingsTimer := time.AfterFunc(firstSettingsTimeout, sc.onSettingsTimer)
-	defer settingsTimer.Stop()
+	sc.settingsTimer = time.AfterFunc(firstSettingsTimeout, sc.onSettingsTimer)
 
-	lastFrameTime := time.Now()
-	loopNum := 0
+	sc.lastFrameTime = time.Now()
+	parked = sc.serveLoop()
+}
+
+// resumeServe runs the serve loop on a new goroutine for a connection
+// whose previous serve goroutine parked while the connection was idle.
+// It is started by beginServeSend, which precedes every send to the
+// serve loop's channels.
+func (sc *serverConn) resumeServe() {
+	// The serve loop's first incarnation has net/http's conn.serve
+	// above it to recover from panics; this one has nothing, so
+	// recover here to keep a panic from crashing the process.
+	defer func() {
+		if err := recover(); err != nil && err != ErrAbortHandler {
+			const size = 64 << 10
+			buf := make([]byte, size)
+			buf = buf[:runtime.Stack(buf, false)]
+			sc.logf("http2: panic serving %v: %v\n%s", sc.conn.RemoteAddr(), err, buf)
+		}
+	}()
+	sc.serveG.setOwner()
+	defer sc.notePanic()
+	parked := false
+	defer func() {
+		if !parked {
+			sc.teardown()
+		}
+	}()
+	parked = sc.serveLoop()
+}
+
+// teardown closes the connection and releases its resources.
+// It runs (on the serve goroutine) when the serve loop exits.
+//
+// Because the serve goroutine may park while the connection is idle
+// (making ServeConn return early), this is also responsible for the
+// cleanup that ServeConn's callers used to do after it returned:
+// unregistering the connection, canceling its base context, and
+// notifying the ServeConnOpts.OnClose hook.
+func (sc *serverConn) teardown() {
+	sc.serveG.check()
+	if t := sc.settingsTimer; t != nil {
+		t.Stop()
+	}
+	if t := sc.readIdleTimer; t != nil {
+		t.Stop()
+	}
+	if t := sc.idleTimer; t != nil {
+		t.Stop()
+	}
+	close(sc.doneServing) // unblocks handlers trying to send
+	sc.stopShutdownTimer()
+	sc.closeAllStreamsOnConnClose()
+	sc.conn.Close()
+	sc.srv.unregisterConn(sc)
+	sc.baseCtxCancel()
+	if f := sc.onClose; f != nil {
+		f()
+	}
+}
+
+// serveLoop is the serve goroutine's main loop, processing frames and
+// messages until the connection is done (returning false) or until it
+// has nothing runnable and the goroutine parks (returning true).
+//
+// After it parks, the serve loop is resumed on a new goroutine by the
+// next message sent to any of its channels: a frame from readFrames, a
+// handler write or body read, a timer firing, or a graceful shutdown
+// request. This way a connection with nothing to do only pins the
+// readFrames goroutine (plus any handler goroutines), whether it's
+// fully idle or its handlers are parked mid-long-poll.
+func (sc *serverConn) serveLoop() (parked bool) {
+	sc.serveG.check()
 	for {
-		loopNum++
+		sc.loopNum++
 		select {
 		case wr := <-sc.wantWriteFrameCh:
+			sc.endServeSend()
 			if se, ok := wr.write.(StreamError); ok {
 				sc.resetStream(se)
 				break
 			}
 			sc.writeFrame(wr)
 		case res := <-sc.wroteFrameCh:
+			sc.endServeSend()
 			sc.wroteFrame(res)
 		case res := <-sc.readFrameCh:
-			lastFrameTime = time.Now()
+			sc.endServeSend()
+			sc.lastFrameTime = time.Now()
 			// Process any written frames before reading new frames from the client since a
 			// written frame could have triggered a new stream to be started.
 			if sc.writingFrameAsync {
 				select {
 				case wroteRes := <-sc.wroteFrameCh:
+					sc.endServeSend()
 					sc.wroteFrame(wroteRes)
 				default:
 				}
 			}
 			if !sc.processFrameFromReader(res) {
-				return
+				return false
 			}
 			res.readMore()
-			if settingsTimer != nil {
-				settingsTimer.Stop()
-				settingsTimer = nil
+			if t := sc.settingsTimer; t != nil {
+				t.Stop()
+				sc.settingsTimer = nil
 			}
 		case m := <-sc.bodyReadCh:
+			sc.endServeSend()
 			sc.noteBodyRead(m.st, m.n)
 		case msg := <-sc.serveMsgCh:
+			sc.endServeSend()
 			switch v := msg.(type) {
 			case func(int):
-				v(loopNum) // for testing
+				v(sc.loopNum) // for testing
 			case *serverMessage:
 				switch v {
 				case settingsTimerMsg:
 					sc.logf("timeout waiting for SETTINGS frames from %v", sc.conn.RemoteAddr())
-					return
+					return false
 				case idleTimerMsg:
 					sc.vlogf("connection is idle")
 					sc.goAway(ErrCodeNo)
 				case readIdleTimerMsg:
-					sc.handlePingTimer(lastFrameTime)
+					sc.handlePingTimer(sc.lastFrameTime)
 				case shutdownTimerMsg:
 					sc.vlogf("GOAWAY close timer fired; closing conn from %v", sc.conn.RemoteAddr())
-					return
+					return false
 				case gracefulShutdownMsg:
 					sc.startGracefulShutdownInternal()
 				case handlerDoneMsg:
@@ -981,7 +1029,7 @@ func (sc *serverConn) serve(conf Config) {
 		// run out of memory.
 		if sc.queuedControlFrames > maxQueuedControlFrames {
 			sc.vlogf("http2: too many control frames in send queue, closing connection")
-			return
+			return false
 		}
 
 		// Start the shutdown timer after sending a GOAWAY. When sending GOAWAY
@@ -992,7 +1040,84 @@ func (sc *serverConn) serve(conf Config) {
 		if sentGoAway && sc.shutdownTimer == nil && (sc.goAwayCode != ErrCodeNo || gracefulShutdownComplete) {
 			sc.shutDownIn(goAwayTimeout)
 		}
+
+		// If the connection is idle, park: let this goroutine exit and
+		// have the next message revive the loop on a new goroutine.
+		if sc.canPark() && sc.tryPark() {
+			return true
+		}
 	}
+}
+
+// canPark reports whether the serve loop has nothing runnable and can
+// park: nothing being written or unflushed, nothing poppable in the
+// write scheduler, and no shutdown in progress.
+//
+// Open streams and running handlers do not prevent parking: everything
+// that could next give the serve loop work (a frame from the peer, a
+// handler write or body read, a timer firing, a graceful shutdown
+// request) reaches it through a channel send preceded by
+// beginServeSend, which revives the loop. A connection whose handlers
+// are parked mid-long-poll therefore doesn't pin a serve goroutine
+// either.
+//
+// The write side is known to be drained because every state change
+// ends in scheduleFrameWrite, which (except in a GOAWAY with an error
+// code, and inGoAway is false here) pops the write scheduler until Pop
+// fails and then flushes, so writingFrame, writingFrameAsync, and
+// needsFrameFlush are all false only once nothing was left to write.
+// With queuedControlFrames == 0, anything still in the scheduler after
+// a failed Pop is a DATA frame blocked on flow control (non-DATA
+// frames are always consumed whole; see FrameWriteRequest.Consume),
+// and only an incoming WINDOW_UPDATE or SETTINGS frame, which arrives
+// via readFrames and revives the loop, can unblock it.
+func (sc *serverConn) canPark() bool {
+	sc.serveG.check()
+	return sc.serveParkingEnabled &&
+		!sc.writingFrame &&
+		!sc.writingFrameAsync &&
+		!sc.needsFrameFlush &&
+		!sc.needToSendGoAway &&
+		!sc.needToSendSettingsAck &&
+		!sc.inGoAway &&
+		sc.queuedControlFrames == 0
+}
+
+// http2serveparking, if "0", disables parking the serve goroutine
+// while a connection has nothing to do, restoring the old behavior of
+// keeping a goroutine parked for the lifetime of each connection.
+//
+// It exists only as a temporary safety measure for the change that
+// parks the serve goroutine. The # prefix marks it as undocumented,
+// so it is not listed in doc/godebug.md or runtime/metrics.
+//
+// TODO: remove this setting; see #81524.
+var http2serveparking = godebug.New("#http2serveparking")
+
+// parkedBit is the flag in serverConn.parkState marking the serve
+// goroutine as parked. The bits below it count pending sends.
+const parkedBit = 1 << 62
+
+// tryPark attempts to mark the serve goroutine as parked, so that the
+// next beginServeSend revives the serve loop on a new goroutine. It
+// fails if a sender has already begun sending a message to one of the
+// serve loop's channels, in which case the caller must keep serving to
+// receive it.
+func (sc *serverConn) tryPark() bool {
+	sc.serveG.check()
+	if sc.parkState.Load() != 0 {
+		// A send is pending (the bit can't be set: we're running).
+		return false
+	}
+	// With no sends pending, the channels must all be empty too, but
+	// parking with a queued message would stall the connection, so be
+	// defensive. This check is safe before the swap below: a sender
+	// that begins after it either bumps the count first, failing the
+	// swap, or sees the parked bit and revives us.
+	if len(sc.readFrameCh)+len(sc.wantWriteFrameCh)+len(sc.wroteFrameCh)+len(sc.bodyReadCh)+len(sc.serveMsgCh) != 0 {
+		return false
+	}
+	return sc.parkState.CompareAndSwap(0, parkedBit)
 }
 
 func (sc *serverConn) handlePingTimer(lastFrameReadTime time.Time) {
@@ -1041,11 +1166,54 @@ func (sc *serverConn) onIdleTimer()     { sc.sendServeMsg(idleTimerMsg) }
 func (sc *serverConn) onReadIdleTimer() { sc.sendServeMsg(readIdleTimerMsg) }
 func (sc *serverConn) onShutdownTimer() { sc.sendServeMsg(shutdownTimerMsg) }
 
+// beginServeSend notes that the caller is about to send a message to
+// one of the serve loop's channels, reviving the serve goroutine if it
+// has parked. Every send to those channels must be preceded by a call
+// to beginServeSend. The send is counted as pending until the serve
+// loop receives the message, or until a sender that bailed out on
+// another select case gives up; both call endServeSend.
+func (sc *serverConn) beginServeSend() {
+	if !sc.serveParkingEnabled {
+		// The serve loop never parks, so there is nothing to count or
+		// revive, and no atomic traffic on the shared word is needed.
+		return
+	}
+	if sc.parkState.Add(1)&parkedBit == 0 {
+		// The common case: the serve goroutine is running.
+		return
+	}
+	// The serve goroutine parked. Our increment keeps it from parking
+	// again until our send is received, so all that's left is to
+	// revive it exactly once: whichever concurrent sender clears the
+	// bit does so.
+	for {
+		old := sc.parkState.Load()
+		if old&parkedBit == 0 {
+			return // another sender is reviving it
+		}
+		if sc.parkState.CompareAndSwap(old, old&^parkedBit) {
+			go sc.resumeServeFunc()
+			return
+		}
+	}
+}
+
+// endServeSend balances an earlier beginServeSend, either because the
+// serve loop received the message or because the sender never sent it.
+func (sc *serverConn) endServeSend() {
+	if !sc.serveParkingEnabled {
+		return
+	}
+	sc.parkState.Add(-1)
+}
+
 func (sc *serverConn) sendServeMsg(msg any) {
 	sc.serveG.checkNotOn() // NOT
+	sc.beginServeSend()
 	select {
 	case sc.serveMsgCh <- msg:
 	case <-sc.doneServing:
+		sc.endServeSend()
 	}
 }
 
@@ -1092,7 +1260,7 @@ var writeDataPool = sync.Pool{
 // writeDataFromHandler writes DATA response frames from a handler on
 // the given stream.
 func (sc *serverConn) writeDataFromHandler(stream *stream, data []byte, endStream bool) error {
-	ch := sc.srv.state.getErrChan()
+	ch := sc.srv.getErrChan()
 	writeArg := writeDataPool.Get().(*writeData)
 	*writeArg = writeData{stream.id, data, endStream}
 	err := sc.writeFrameFromHandler(FrameWriteRequest{
@@ -1124,7 +1292,7 @@ func (sc *serverConn) writeDataFromHandler(stream *stream, data []byte, endStrea
 			return errStreamClosed
 		}
 	}
-	sc.srv.state.putErrChan(ch)
+	sc.srv.putErrChan(ch)
 	if frameWriteDone {
 		writeDataPool.Put(writeArg)
 	}
@@ -1140,12 +1308,14 @@ func (sc *serverConn) writeDataFromHandler(stream *stream, data []byte, endStrea
 // goroutine, call writeFrame instead.
 func (sc *serverConn) writeFrameFromHandler(wr FrameWriteRequest) error {
 	sc.serveG.checkNotOn() // NOT
+	sc.beginServeSend()
 	select {
 	case sc.wantWriteFrameCh <- wr:
 		return nil
 	case <-sc.doneServing:
 		// Serve loop is gone.
 		// Client has closed their connection to the server.
+		sc.endServeSend()
 		return errClientDisconnected
 	}
 }
@@ -1255,6 +1425,16 @@ func (sc *serverConn) startFrameWrite(wr FrameWriteRequest) {
 
 	sc.writingFrame = true
 	sc.needsFrameFlush = true
+	if sc.pendingEncoderTableSize {
+		// hpackEncoder may be in use by writeFrameAsync, so SETTINGS
+		// changes to it are deferred until no frame is being written.
+		// Replaying the smallest size before the latest one keeps the
+		// encoder's view identical to having applied every change
+		// (RFC 7541, Section 4.2).
+		sc.pendingEncoderTableSize = false
+		sc.hpackEncoder.SetMaxDynamicTableSize(sc.encoderTableSizeMin)
+		sc.hpackEncoder.SetMaxDynamicTableSize(sc.encoderTableSize)
+	}
 	if wr.write.staysWithinBuffer(sc.bw.Available()) {
 		sc.writingFrameAsync = false
 		err := wr.write.writeFrame(sc)
@@ -1354,6 +1534,11 @@ func (sc *serverConn) scheduleFrameWrite() {
 	}
 	sc.inFrameScheduleLoop = true
 	for !sc.writingFrameAsync {
+		if sc.flow.flowErr && (!sc.inGoAway || sc.goAwayCode == ErrCodeNo) {
+			sc.inGoAway = true
+			sc.needToSendGoAway = true
+			sc.goAwayCode = ErrCodeFlowControl
+		}
 		if sc.needToSendGoAway {
 			sc.needToSendGoAway = false
 			sc.startFrameWrite(FrameWriteRequest{
@@ -1375,6 +1560,9 @@ func (sc *serverConn) scheduleFrameWrite() {
 					sc.queuedControlFrames--
 				}
 				sc.startFrameWrite(wr)
+				continue
+			}
+			if sc.flow.flowErr {
 				continue
 			}
 		}
@@ -1467,7 +1655,7 @@ func (sc *serverConn) processFrameFromReader(res readFrameResult) bool {
 			// (e.g. CloseWrite) because they're done
 			// sending frames but they're still wanting
 			// our open replies?  Investigate.
-			// TODO: add CloseWrite to tls "github.com/refraction-networking/utls".Conn first
+			// TODO: add CloseWrite to crypto/tls.Conn first
 			// so we have a way to test this? I suppose
 			// just for testing we could have a non-TLS mode.
 			return false
@@ -1609,6 +1797,10 @@ func (sc *serverConn) processWindowUpdate(f *WindowUpdateFrame) error {
 			return nil
 		}
 		if !st.flow.add(int32(f.Increment)) {
+			if st.flow.conn.flowErr {
+				// This is a lazily-detected connection-level flow control error.
+				return sc.countError("bad_flow", ConnectionError(ErrCodeFlowControl))
+			}
 			return sc.countError("bad_flow", streamError(f.StreamID, ErrCodeFlowControl))
 		}
 	default: // connection-level flow control
@@ -1659,18 +1851,15 @@ func (sc *serverConn) closeStream(st *stream, err error) {
 	delete(sc.streams, st.id)
 	if len(sc.streams) == 0 {
 		sc.setConnState(ConnStateIdle)
-		if sc.srv.IdleTimeout > 0 && sc.idleTimer != nil {
-			sc.idleTimer.Reset(sc.srv.IdleTimeout)
+		idleTimeout := sc.hs.IdleTimeout()
+		if idleTimeout > 0 && sc.idleTimer != nil {
+			sc.idleTimer.Reset(idleTimeout)
 		}
 		if h1ServerKeepAlivesDisabled(sc.hs) {
 			sc.startGracefulShutdownInternal()
 		}
 	}
 	if p := st.body; p != nil {
-		// Return any buffered unread bytes worth of conn-level flow control.
-		// See golang.org/issue/16481
-		sc.sendWindowUpdate(nil, p.Len())
-
 		p.CloseWithError(err)
 	}
 	if e, ok := err.(StreamError); ok {
@@ -1695,6 +1884,17 @@ func (sc *serverConn) processSettings(f *SettingsFrame) error {
 			// The spec doesn't mention this case, but
 			// hang up on them anyway.
 			return sc.countError("ack_mystery", ConnectionError(ErrCodeProtocol))
+		}
+		if sc.pendingDecoderTableSize != 0 {
+			// The client has acknowledged our SETTINGS, so all header
+			// blocks it sends from now on were encoded with knowledge
+			// of our lower HEADER_TABLE_SIZE. It is now safe to apply
+			// the configured size to the decoder. The read goroutine
+			// is parked until readMore is called, so mutating the
+			// decoder here is race-free.
+			sc.framer.ReadMetaHeaders.SetAllowedMaxDynamicTableSize(sc.pendingDecoderTableSize)
+			sc.framer.ReadMetaHeaders.SetMaxDynamicTableSize(sc.pendingDecoderTableSize)
+			sc.pendingDecoderTableSize = 0
 		}
 		return nil
 	}
@@ -1724,7 +1924,12 @@ func (sc *serverConn) processSetting(s Setting) error {
 	}
 	switch s.ID {
 	case SettingHeaderTableSize:
-		sc.hpackEncoder.SetMaxDynamicTableSize(s.Val)
+		// Applied by startFrameWrite; see comment there.
+		if !sc.pendingEncoderTableSize || s.Val < sc.encoderTableSizeMin {
+			sc.encoderTableSizeMin = s.Val
+		}
+		sc.encoderTableSize = s.Val
+		sc.pendingEncoderTableSize = true
 	case SettingEnablePush:
 		sc.pushEnabled = s.Val != 0
 	case SettingMaxConcurrentStreams:
@@ -1755,28 +1960,14 @@ func (sc *serverConn) processSetting(s Setting) error {
 
 func (sc *serverConn) processSettingInitialWindowSize(val uint32) error {
 	sc.serveG.check()
-	// Note: val already validated to be within range by
-	// processSetting's Valid call.
-
-	// "A SETTINGS frame can alter the initial flow control window
-	// size for all current streams. When the value of
-	// SETTINGS_INITIAL_WINDOW_SIZE changes, a receiver MUST
-	// adjust the size of all stream flow control windows that it
-	// maintains by the difference between the new value and the
-	// old value."
-	old := sc.initialStreamSendWindowSize
-	sc.initialStreamSendWindowSize = int32(val)
-	growth := int32(val) - old // may be negative
-	for _, st := range sc.streams {
-		if !st.flow.add(growth) {
-			// 6.9.2 Initial Flow Control Window Size
-			// "An endpoint MUST treat a change to
-			// SETTINGS_INITIAL_WINDOW_SIZE that causes any flow
-			// control window to exceed the maximum size as a
-			// connection error (Section 5.4.1) of type
-			// FLOW_CONTROL_ERROR."
-			return sc.countError("setting_win_size", ConnectionError(ErrCodeFlowControl))
-		}
+	if !sc.flow.changeInitialWindowSize(int64(val)) {
+		// 6.9.2 Initial Flow Control Window Size
+		// "An endpoint MUST treat a change to
+		// SETTINGS_INITIAL_WINDOW_SIZE that causes any flow
+		// control window to exceed the maximum size as a
+		// connection error (Section 5.4.1) of type
+		// FLOW_CONTROL_ERROR."
+		return sc.countError("setting_win_size", ConnectionError(ErrCodeFlowControl))
 	}
 	return nil
 }
@@ -2049,30 +2240,42 @@ func (sc *serverConn) processHeaders(f *MetaHeadersFrame) error {
 	if st.reqTrailer != nil {
 		st.trailer = make(Header)
 	}
-	st.body = req.Body.(*requestBody).pipe // may be nil
+	st.body = st.reqBody.pipe // may be nil
 	st.declBodyBytes = req.ContentLength
 
-	handler := sc.handler.ServeHTTP
+	handleRequest := sc.handleRequest
 	if f.Truncated {
 		// Their header list was too long. Send a 431 error.
-		handler = handleHeaderListTooLong
+		handleRequest = handleHeaderListTooLong
 	} else if err := checkValidHTTP2RequestHeaders(req.Header); err != nil {
-		handler = serve400Handler{err}.ServeHTTP
+		handleRequest = serve400Handler(err)
 	}
 
-	// The net/http package sets the read deadline from the
-	// http.Server.ReadTimeout during the TLS handshake, but then
-	// passes the connection off to us with the deadline already
-	// set. Disarm it here after the request headers are read,
-	// similar to how the http1 server works. Here it's
-	// technically more like the http1 Server's ReadHeaderTimeout
-	// (in Go 1.8), though. That's a more sane option anyway.
 	if sc.hs.ReadTimeout() > 0 {
-		sc.conn.SetReadDeadline(time.Time{})
 		st.readDeadline = time.AfterFunc(sc.hs.ReadTimeout(), st.onReadTimeout)
 	}
 
-	return sc.scheduleHandler(id, rw, req, handler)
+	return sc.scheduleHandler(st, rw, req, handleRequest)
+}
+
+func (sc *serverConn) upgradeRequest(req *ServerRequest) {
+	sc.serveG.check()
+	id := uint32(1)
+	sc.maxClientStreamID = id
+	st := sc.newStream(id, 0, stateHalfClosedRemote, defaultRFC9218Priority(sc.priorityAware && !sc.hasIntermediary))
+	st.reqTrailer = req.Trailer
+	if st.reqTrailer != nil {
+		st.trailer = make(Header)
+	}
+	rw := sc.newResponseWriter(st)
+	rw.rws.req = *req
+	req = &rw.rws.req
+
+	// This is the first request on the connection,
+	// so start the handler directly rather than going
+	// through scheduleHandler.
+	sc.curHandlers++
+	go sc.runHandler(rw, req, sc.handleRequest)
 }
 
 func (st *stream) processTrailerHeaders(f *MetaHeadersFrame) error {
@@ -2088,6 +2291,9 @@ func (st *stream) processTrailerHeaders(f *MetaHeadersFrame) error {
 
 	if len(f.PseudoFields()) > 0 {
 		return sc.countError("trailers_pseudo", streamError(st.id, ErrCodeProtocol))
+	}
+	if f.Truncated {
+		return sc.countError("trailers_too_large", streamError(st.id, ErrCodeProtocol))
 	}
 	if st.trailer != nil {
 		for _, hf := range f.RegularFields() {
@@ -2117,7 +2323,8 @@ func (sc *serverConn) checkPriority(streamID uint32, p PriorityParam) error {
 }
 
 func (sc *serverConn) processPriority(f *PriorityFrame) error {
-	if err := sc.checkPriority(f.HTTP2FrameHeader.StreamID, f.HTTP2PriorityParam); err != nil {
+	id, priority := f.HTTP2FrameHeader.StreamID, f.HTTP2PriorityParam
+	if err := sc.checkPriority(id, priority); err != nil {
 		return err
 	}
 	// We need to avoid calling AdjustStream when using the RFC 9218 write
@@ -2128,7 +2335,7 @@ func (sc *serverConn) processPriority(f *PriorityFrame) error {
 	if sc.writeSchedIgnoresRFC7540() {
 		return nil
 	}
-	sc.writeSched.AdjustStream(f.HTTP2FrameHeader.StreamID, f.HTTP2PriorityParam)
+	sc.writeSched.AdjustStream(id, priority)
 	return nil
 }
 
@@ -2161,7 +2368,6 @@ func (sc *serverConn) newStream(id, pusherID uint32, state streamState, priority
 	}
 	st.cw.Init()
 	st.flow.conn = &sc.flow // link to conn-level counter
-	st.flow.add(sc.initialStreamSendWindowSize)
 	st.inflow.init(sc.initialStreamRecvWindowSize)
 	if writeTimeout := sc.hs.WriteTimeout(); writeTimeout > 0 {
 		st.writeDeadline = time.AfterFunc(writeTimeout, st.onWriteTimeout)
@@ -2184,16 +2390,29 @@ func (sc *serverConn) newStream(id, pusherID uint32, state streamState, priority
 func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*responseWriter, *ServerRequest, error) {
 	sc.serveG.check()
 
-	rp := httpcommon.ServerRequestParam{
-		Method:    f.PseudoValue("method"),
-		Scheme:    f.PseudoValue("scheme"),
-		Authority: f.PseudoValue("authority"),
-		Path:      f.PseudoValue("path"),
-		Protocol:  f.PseudoValue("protocol"),
+	rp := httpcommon.ServerRequestParam{}
+	for _, hf := range f.Fields {
+		// No pseudo-headers may have a zero-length value.
+		// Rejecting them here means we can assume "" means "no header" below.
+		if hf.Name == "" || (hf.Name[0] == ':' && len(hf.Value) == 0) {
+			return nil, nil, sc.countError("invalid_pseudo_header", streamError(f.StreamID, ErrCodeProtocol))
+		}
+		switch hf.Name {
+		case ":method":
+			rp.Method = hf.Value
+		case ":scheme":
+			rp.Scheme = hf.Value
+		case ":authority":
+			rp.Authority = hf.Value
+		case ":path":
+			rp.Path = hf.Value
+		case ":protocol":
+			rp.Protocol = hf.Value
+		}
 	}
 
 	// extended connect is disabled, so we should not see :protocol
-	if disableExtendedConnectProtocol && rp.Protocol != "" {
+	if !sc.extendedConnectAllowed && rp.Protocol != "" {
 		return nil, nil, sc.countError("bad_connect", streamError(f.StreamID, ErrCodeProtocol))
 	}
 
@@ -2233,17 +2452,29 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
 		return nil, nil, err
 	}
 	bodyOpen := !f.StreamEnded()
-	if bodyOpen {
-		if vv, ok := rp.Header["Content-Length"]; ok {
-			if cl, err := strconv.ParseUint(vv[0], 10, 63); err == nil {
-				req.ContentLength = int64(cl)
-			} else {
-				req.ContentLength = 0
-			}
+	if clens, ok := rp.Header["Content-Length"]; ok {
+		if cl, err := strconv.ParseUint(clens[0], 10, 63); err == nil {
+			req.ContentLength = int64(cl)
 		} else {
+			req.ContentLength = 0
+		}
+		if !bodyOpen && req.ContentLength != 0 {
+			return nil, nil, sc.countError("bodyless_content_length", streamError(f.StreamID, ErrCodeProtocol))
+		}
+		if len(clens) > 1 {
+			for _, dup := range clens[1:] {
+				if clens[0] != dup {
+					return nil, nil, sc.countError("duplicate_content_length", streamError(f.StreamID, ErrCodeProtocol))
+				}
+			}
+			rp.Header["Content-Length"] = clens[:1]
+		}
+	}
+	if bodyOpen {
+		if _, ok := rp.Header["Content-Length"]; !ok {
 			req.ContentLength = -1
 		}
-		req.Body.(*requestBody).pipe = &pipe{
+		st.reqBody.pipe = &pipe{
 			b: &dataBuffer{expected: req.ContentLength},
 		}
 	}
@@ -2253,17 +2484,12 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
 func (sc *serverConn) newWriterAndRequestNoBody(st *stream, rp httpcommon.ServerRequestParam) (*responseWriter, *ServerRequest, error) {
 	sc.serveG.check()
 
-	var tlsState *tls.ConnectionState // nil if not scheme https
-	if rp.Scheme == "https" {
-		tlsState = sc.tlsState
-	}
-
 	res := httpcommon.NewServerRequest(rp)
 	if res.InvalidReason != "" {
 		return nil, nil, sc.countError(res.InvalidReason, streamError(st.id, ErrCodeProtocol))
 	}
 
-	body := &requestBody{
+	st.reqBody = &requestBody{
 		conn:          sc,
 		stream:        st,
 		needsContinue: res.NeedsContinue,
@@ -2279,9 +2505,9 @@ func (sc *serverConn) newWriterAndRequestNoBody(st *stream, rp httpcommon.Server
 		Proto:      "HTTP/2.0",
 		ProtoMajor: 2,
 		ProtoMinor: 0,
-		TLS:        tlsState,
+		TLS:        sc.tlsState,
 		Host:       rp.Authority,
-		Body:       body,
+		Body:       st.reqBody,
 		Trailer:    res.Trailer,
 	}
 	return rw, &rw.rws.req, nil
@@ -2289,40 +2515,39 @@ func (sc *serverConn) newWriterAndRequestNoBody(st *stream, rp httpcommon.Server
 
 func (sc *serverConn) newResponseWriter(st *stream) *responseWriter {
 	rws := responseWriterStatePool.Get().(*responseWriterState)
-	bwSave := rws.bw
 	*rws = responseWriterState{} // zero all the fields
 	rws.conn = sc
-	rws.bw = bwSave
-	rws.bw.Reset(chunkWriter{rws})
 	rws.stream = st
 	return &responseWriter{rws: rws}
 }
 
 type unstartedHandler struct {
-	streamID uint32
-	rw       *responseWriter
-	req      *ServerRequest
-	handler  func(*ResponseWriter, *ServerRequest)
+	streamID      uint32
+	rw            *responseWriter
+	req           *ServerRequest
+	handleRequest func(*ResponseWriter, *ServerRequest) error
+	body          *pipe
 }
 
 // scheduleHandler starts a handler goroutine,
 // or schedules one to start as soon as an existing handler finishes.
-func (sc *serverConn) scheduleHandler(streamID uint32, rw *responseWriter, req *ServerRequest, handler func(*ResponseWriter, *ServerRequest)) error {
+func (sc *serverConn) scheduleHandler(st *stream, rw *responseWriter, req *ServerRequest, handleRequest func(*ResponseWriter, *ServerRequest) error) error {
 	sc.serveG.check()
 	maxHandlers := sc.advMaxStreams
 	if sc.curHandlers < maxHandlers {
 		sc.curHandlers++
-		go sc.runHandler(rw, req, handler)
+		go sc.runHandler(rw, req, handleRequest)
 		return nil
 	}
 	if len(sc.unstartedHandlers) > int(4*sc.advMaxStreams) {
 		return sc.countError("too_many_early_resets", ConnectionError(ErrCodeEnhanceYourCalm))
 	}
 	sc.unstartedHandlers = append(sc.unstartedHandlers, unstartedHandler{
-		streamID: streamID,
-		rw:       rw,
-		req:      req,
-		handler:  handler,
+		streamID:      st.id,
+		rw:            rw,
+		req:           req,
+		handleRequest: handleRequest,
+		body:          st.body,
 	})
 	return nil
 }
@@ -2336,13 +2561,17 @@ func (sc *serverConn) handlerDone() {
 		u := sc.unstartedHandlers[i]
 		if sc.streams[u.streamID] == nil {
 			// This stream was reset before its goroutine had a chance to start.
+			if u.body != nil {
+				u.body.BreakWithError(errClosedBody)
+				sc.sendWindowUpdate(nil, u.body.Len())
+			}
 			continue
 		}
 		if sc.curHandlers >= maxHandlers {
 			break
 		}
 		sc.curHandlers++
-		go sc.runHandler(u.rw, u.req, u.handler)
+		go sc.runHandler(u.rw, u.req, u.handleRequest)
 		sc.unstartedHandlers[i] = unstartedHandler{} // don't retain references
 	}
 	sc.unstartedHandlers = sc.unstartedHandlers[i:]
@@ -2352,36 +2581,27 @@ func (sc *serverConn) handlerDone() {
 }
 
 // Run on its own goroutine.
-func (sc *serverConn) runHandler(rw *responseWriter, req *ServerRequest, handler func(*ResponseWriter, *ServerRequest)) {
+func (sc *serverConn) runHandler(rw *responseWriter, req *ServerRequest, handleRequest func(*ResponseWriter, *ServerRequest) error) {
 	defer sc.sendServeMsg(handlerDoneMsg)
-	didPanic := true
-	defer func() {
-		rw.rws.stream.cancelCtx()
-		if req.MultipartForm != nil {
-			req.MultipartForm.RemoveAll()
-		}
-		if didPanic {
-			e := recover()
-			sc.writeFrameFromHandler(FrameWriteRequest{
-				write:  handlerPanicRST{rw.rws.stream.id},
-				stream: rw.rws.stream,
-			})
-			// Same as net/http:
-			if e != nil && e != ErrAbortHandler {
-				const size = 64 << 10
-				buf := make([]byte, size)
-				buf = buf[:runtime.Stack(buf, false)]
-				sc.logf("http2: panic serving %v: %v\n%s", sc.conn.RemoteAddr(), e, buf)
-			}
-			return
-		}
-		rw.handlerDone()
-	}()
-	handler(rw, req)
-	didPanic = false
+	err := handleRequest(rw, req)
+	rw.rws.stream.cancelCtx()
+	if b := rw.rws.stream.reqBody; b != nil {
+		// Closing the body refunds flow control credit for any unconsumed data.
+		// (reqBody is nil for Upgrade: h2c requests, but those do not use flow
+		// control for the request body.)
+		b.Close()
+	}
+	if err != nil {
+		sc.writeFrameFromHandler(FrameWriteRequest{
+			write:  handlerPanicRST{rw.rws.stream.id},
+			stream: rw.rws.stream,
+		})
+		return
+	}
+	rw.handlerDone()
 }
 
-func handleHeaderListTooLong(w *ResponseWriter, r *ServerRequest) {
+func handleHeaderListTooLong(w *ResponseWriter, r *ServerRequest) error {
 	// 10.5.1 Limits on Header Block Size:
 	// .. "A server that receives a larger header block than it is
 	// willing to handle can send an HTTP 431 (Request Header Fields Too
@@ -2389,6 +2609,7 @@ func handleHeaderListTooLong(w *ResponseWriter, r *ServerRequest) {
 	const statusRequestHeaderFieldsTooLarge = 431 // only in Go 1.6+
 	w.WriteHeader(statusRequestHeaderFieldsTooLarge)
 	io.WriteString(w, "<h1>HTTP Error 431</h1><p>Request Header Field(s) Too Large</p>")
+	return nil // nil because non-nil error is only used for panic.
 }
 
 // called from handler goroutines.
@@ -2401,7 +2622,7 @@ func (sc *serverConn) writeHeaders(st *stream, headerData *writeResHeaders) erro
 		// waiting for this frame to be written, so an http.Flush mid-handler
 		// writes out the correct value of keys, before a handler later potentially
 		// mutates it.
-		errc = sc.srv.state.getErrChan()
+		errc = sc.srv.getErrChan()
 	}
 	if err := sc.writeFrameFromHandler(FrameWriteRequest{
 		write:  headerData,
@@ -2413,7 +2634,7 @@ func (sc *serverConn) writeHeaders(st *stream, headerData *writeResHeaders) erro
 	if errc != nil {
 		select {
 		case err := <-errc:
-			sc.srv.state.putErrChan(errc)
+			sc.srv.putErrChan(errc)
 			return err
 		case <-sc.doneServing:
 			return errClientDisconnected
@@ -2445,9 +2666,11 @@ type bodyReadMsg struct {
 func (sc *serverConn) noteBodyReadFromHandler(st *stream, n int, err error) {
 	sc.serveG.checkNotOn() // NOT on
 	if n > 0 {
+		sc.beginServeSend()
 		select {
 		case sc.bodyReadCh <- bodyReadMsg{st, n}:
 		case <-sc.doneServing:
+			sc.endServeSend()
 		}
 	}
 }
@@ -2455,7 +2678,7 @@ func (sc *serverConn) noteBodyReadFromHandler(st *stream, n int, err error) {
 func (sc *serverConn) noteBodyRead(st *stream, n int) {
 	sc.serveG.check()
 	sc.sendWindowUpdate(nil, n) // conn-level
-	if st.state != stateHalfClosedRemote && st.state != stateClosed {
+	if st != nil && st.state != stateHalfClosedRemote && st.state != stateClosed {
 		// Don't send this WINDOW_UPDATE if the stream is closed
 		// remotely.
 		sc.sendWindowUpdate(st, n)
@@ -2503,6 +2726,9 @@ func (b *requestBody) Close() error {
 	b.closeOnce.Do(func() {
 		if b.pipe != nil {
 			b.pipe.BreakWithError(errClosedBody)
+			if unread := b.pipe.Len(); unread > 0 {
+				b.conn.noteBodyReadFromHandler(nil, unread, errClosedBody)
+			}
 		}
 	})
 	return nil
@@ -2519,9 +2745,6 @@ func (b *requestBody) Read(p []byte) (n int, err error) {
 	n, err = b.pipe.Read(p)
 	if err == io.EOF {
 		b.sawEOF = true
-	}
-	if b.conn == nil {
-		return
 	}
 	b.conn.noteBodyReadFromHandler(b.stream, n, err)
 	return
@@ -2544,7 +2767,13 @@ type responseWriterState struct {
 	conn   *serverConn
 
 	// TODO: adjust buffer writing sizes based on server config, frame size updates from peer, etc
-	bw *bufio.Writer // writing to a chunkWriter{this *responseWriterState}
+	//
+	// bw buffers handler writes, writing to a chunkWriter{this
+	// *responseWriterState}. It is nil until the first buffered write
+	// (see responseWriter.write) and is returned to handlerWriterPool
+	// (and set nil again) whenever a Flush leaves it empty, so a
+	// handler parked mid-response doesn't pin a buffer.
+	bw *bufio.Writer
 
 	// mutated by http.Handler goroutine:
 	handlerHeader Header   // nil until called
@@ -2595,9 +2824,7 @@ func (rws *responseWriterState) declareTrailer(k string) {
 		rws.conn.logf("ignoring invalid trailer %q", k)
 		return
 	}
-	if !slices.Contains(rws.trailers, k) {
-		rws.trailers = append(rws.trailers, k)
-	}
+	rws.trailers = append(rws.trailers, k)
 }
 
 const TimeFormat = "Mon, 02 Jan 2006 15:04:05 GMT" // keep in sync with net/http
@@ -2656,10 +2883,9 @@ func (rws *responseWriterState) writeChunk(p []byte) (n int, err error) {
 		// down the TCP connection when idle, like we do for HTTP/1.
 		// TODO: remove more Connection-specific header fields here, in addition
 		// to "Connection".
-		if _, ok := rws.snapHeader["Connection"]; ok {
-			v := rws.snapHeader.Get("Connection")
+		if vv, ok := rws.snapHeader["Connection"]; ok {
 			delete(rws.snapHeader, "Connection")
-			if v == "close" {
+			if httpguts.HeaderValuesContainsToken(vv, "close") {
 				rws.conn.startGracefulShutdown()
 			}
 		}
@@ -2690,7 +2916,7 @@ func (rws *responseWriterState) writeChunk(p []byte) (n int, err error) {
 
 	// only send trailers if they have actually been defined by the
 	// server handler.
-	hasNonemptyTrailers := rws.hasNonemptyTrailers()
+	hasNonemptyTrailers := rws.handlerDone && rws.hasNonemptyTrailers()
 	endStream := rws.handlerDone && !hasNonemptyTrailers
 	if len(p) > 0 || endStream {
 		// only send a 0 byte DATA frame if we're ending the stream.
@@ -2699,7 +2925,11 @@ func (rws *responseWriterState) writeChunk(p []byte) (n int, err error) {
 		}
 	}
 
-	if rws.handlerDone && hasNonemptyTrailers {
+	if hasNonemptyTrailers {
+		if len(rws.trailers) > 1 {
+			slices.Sort(rws.trailers)
+			rws.trailers = slices.Compact(rws.trailers)
+		}
 		err = rws.conn.writeHeaders(rws.stream, &writeResHeaders{
 			streamID:  rws.stream.id,
 			h:         rws.handlerHeader,
@@ -2755,10 +2985,6 @@ func (rws *responseWriterState) promoteUndeclaredTrailers() {
 		trailerKey := strings.TrimPrefix(k, TrailerPrefix)
 		rws.declareTrailer(trailerKey)
 		rws.handlerHeader[textproto.CanonicalMIMEHeaderKey(trailerKey)] = vv
-	}
-
-	if len(rws.trailers) > 1 {
-		slices.Sort(rws.trailers)
 	}
 }
 
@@ -2826,12 +3052,19 @@ func (w *responseWriter) Flush() {
 func (w *responseWriter) FlushError() error {
 	rws := w.rws
 	if rws == nil {
-		panic("Header called after Handler finished")
+		panic("Flush called after Handler finished")
 	}
 	var err error
-	if rws.bw.Buffered() > 0 {
+	if rws.bw != nil && rws.bw.Buffered() > 0 {
 		err = rws.bw.Flush()
+		if err == nil {
+			rws.releaseWriteBuffer()
+		}
 	} else {
+		if rws.bw != nil {
+			// If a >4KB write allocated a bufio before it flushed itself, release.
+			rws.releaseWriteBuffer()
+		}
 		// The bufio.Writer won't call chunkWriter.Write
 		// (writeChunk with zero bytes), so we have to do it
 		// ourselves to force the HTTP response header and/or
@@ -2985,6 +3218,10 @@ func (w *responseWriter) write(lenData int, dataB []byte, dataS string) (n int, 
 		return 0, errors.New("http2: handler wrote more than declared Content-Length")
 	}
 
+	if rws.bw == nil {
+		rws.bw = handlerWriterPool.Get().(*bufio.Writer)
+		rws.bw.Reset(chunkWriter{rws})
+	}
 	if dataB != nil {
 		return rws.bw.Write(dataB)
 	} else {
@@ -2992,10 +3229,23 @@ func (w *responseWriter) write(lenData int, dataB []byte, dataS string) (n int, 
 	}
 }
 
+// releaseWriteBuffer returns rws.bw to handlerWriterPool.
+func (rws *responseWriterState) releaseWriteBuffer() {
+	bw := rws.bw
+	rws.bw = nil
+	bw.Reset(nil) // don't retain the chunkWriter's rws pointer in the pool
+	handlerWriterPool.Put(bw)
+}
+
 func (w *responseWriter) handlerDone() {
 	rws := w.rws
 	rws.handlerDone = true
 	w.Flush()
+	if rws.bw != nil {
+		// A failed Flush left data (and a sticky error) behind;
+		// discard both and recycle the buffer.
+		rws.releaseWriteBuffer()
+	}
 	w.rws = nil
 	responseWriterStatePool.Put(rws)
 }
@@ -3056,12 +3306,12 @@ func (w *responseWriter) Push(target, method string, header Header) error {
 		// but PUSH_PROMISE requests cannot have a body.
 		// http://tools.ietf.org/html/rfc7540#section-8.2
 		// Also disallow Host, since the promised URL must be absolute.
-		if asciiEqualFold(k, "content-length") ||
-			asciiEqualFold(k, "content-encoding") ||
-			asciiEqualFold(k, "trailer") ||
-			asciiEqualFold(k, "te") ||
-			asciiEqualFold(k, "expect") ||
-			asciiEqualFold(k, "host") {
+		if ascii.EqualFold(k, "content-length") ||
+			ascii.EqualFold(k, "content-encoding") ||
+			ascii.EqualFold(k, "trailer") ||
+			ascii.EqualFold(k, "te") ||
+			ascii.EqualFold(k, "expect") ||
+			ascii.EqualFold(k, "host") {
 			return fmt.Errorf("promised request headers cannot include %q", k)
 		}
 	}
@@ -3081,13 +3331,16 @@ func (w *responseWriter) Push(target, method string, header Header) error {
 		method: method,
 		url:    u,
 		header: cloneHeader(header),
-		done:   sc.srv.state.getErrChan(),
+		done:   sc.srv.getErrChan(),
 	}
 
+	sc.beginServeSend()
 	select {
 	case <-sc.doneServing:
+		sc.endServeSend()
 		return errClientDisconnected
 	case <-st.cw:
+		sc.endServeSend()
 		return errStreamClosed
 	case sc.serveMsgCh <- msg:
 	}
@@ -3098,7 +3351,7 @@ func (w *responseWriter) Push(target, method string, header Header) error {
 	case <-st.cw:
 		return errStreamClosed
 	case err := <-msg.done:
-		sc.srv.state.putErrChan(msg.done)
+		sc.srv.putErrChan(msg.done)
 		return err
 	}
 }
@@ -3175,7 +3428,7 @@ func (sc *serverConn) startPush(msg *startPushRequest) {
 		}
 
 		sc.curHandlers++
-		go sc.runHandler(rw, req, sc.handler.ServeHTTP)
+		go sc.runHandler(rw, req, sc.handleRequest)
 		return promisedID, nil
 	}
 
@@ -3235,33 +3488,28 @@ func checkValidHTTP2RequestHeaders(h Header) error {
 	return nil
 }
 
-type serve400Handler struct {
-	err error
-}
+func serve400Handler(err error) func(*ResponseWriter, *ServerRequest) error {
+	return func(w *ResponseWriter, r *ServerRequest) error {
+		const statusBadRequest = 400
 
-func (handler serve400Handler) ServeHTTP(w *ResponseWriter, r *ServerRequest) {
-	const statusBadRequest = 400
-
-	// TODO: Dedup with http.Error?
-	h := w.Header()
-	h.Del("Content-Length")
-	h.Set("Content-Type", "text/plain; charset=utf-8")
-	h.Set("X-Content-Type-Options", "nosniff")
-	w.WriteHeader(statusBadRequest)
-	fmt.Fprintln(w, handler.err.Error())
+		// TODO: Dedup with http.Error?
+		h := w.Header()
+		h.Del("Content-Length")
+		h.Set("Content-Type", "text/plain; charset=utf-8")
+		h.Set("X-Content-Type-Options", "nosniff")
+		w.WriteHeader(statusBadRequest)
+		fmt.Fprintln(w, err.Error())
+		return nil // nil because non-nil error is only used for panic.
+	}
 }
 
 // h1ServerKeepAlivesDisabled reports whether hs has its keep-alives
-// disabled. See comments on h1ServerShutdownChan above for why
-// the code is written this way.
+// disabled.
 func h1ServerKeepAlivesDisabled(hs ServerConfig) bool {
 	return !hs.DoKeepAlives()
 }
 
 func (sc *serverConn) countError(name string, err error) error {
-	if sc == nil || sc.srv == nil {
-		return err
-	}
 	f := sc.countErrorFunc
 	if f == nil {
 		return err
